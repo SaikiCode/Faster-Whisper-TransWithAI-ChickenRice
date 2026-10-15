@@ -46,7 +46,17 @@ except Exception as e:
 # Import modern i18n module for translations
 from . import i18n_modern as i18n
 from . import inject_vad, precomputed_speech_probs, uninject_vad
-from .smart_split import CHUNK_FINAL, CHUNK_FORCED, AudioChunk, choose_anchor, find_chunk_end, smooth_probs
+from .smart_split import (
+    CHUNK_FINAL,
+    CHUNK_FORCED,
+    AudioChunk,
+    SpeechMap,
+    choose_anchor,
+    concat_speech,
+    find_chunk_end,
+    needs_sequential_retry,
+    smooth_probs,
+)
 from .vad_manager import VadConfig, VadModelManager, resolve_neg_threshold
 
 # Convenience imports
@@ -334,17 +344,8 @@ def _normalize_merge_text(text: str) -> str:
 
 
 def vad_segments_to_clip_timestamps(
-    vad_segments: list[dict[str, Any]], sampling_rate: int = WHISPER_SAMPLING_RATE, *, batched: bool = False
-) -> list[float] | list[dict[str, float]]:
-    if batched:
-        clips: list[dict[str, float]] = []
-        for segment in vad_segments:
-            start = float(segment["start"]) / sampling_rate
-            end = float(segment["end"]) / sampling_rate
-            if end > start:
-                clips.append({"start": start, "end": end})
-        return clips
-
+    vad_segments: list[dict[str, Any]], sampling_rate: int = WHISPER_SAMPLING_RATE
+) -> list[float]:
     timestamps: list[float] = []
     for segment in vad_segments:
         start = float(segment["start"]) / sampling_rate
@@ -798,7 +799,7 @@ class Inference:
         self.vad_injected = True
         logger.info(_("info.vad_activated", threshold=vad_config.threshold))
 
-    def _prepare_transcription(self, audio_path: str, *, batched: bool) -> tuple[Any, dict[str, Any], float | None]:
+    def _prepare_transcription(self, audio_path: str) -> tuple[Any, dict[str, Any], float | None]:
         config = dict(self.generation_config)
 
         if self.smart_split_options.enabled or not config.get("vad_filter") or "clip_timestamps" in config:
@@ -818,11 +819,7 @@ class Inference:
         duration_after_vad = sum(segment["end"] - segment["start"] for segment in vad_segments) / WHISPER_SAMPLING_RATE
 
         config["vad_filter"] = False
-        config["clip_timestamps"] = vad_segments_to_clip_timestamps(
-            vad_segments,
-            WHISPER_SAMPLING_RATE,
-            batched=batched,
-        )
+        config["clip_timestamps"] = vad_segments_to_clip_timestamps(vad_segments, WHISPER_SAMPLING_RATE)
         config.setdefault("beam_size", 1)
         config.setdefault("condition_on_previous_text", False)
 
@@ -857,6 +854,22 @@ class Inference:
         threshold = vad_parameters.get("threshold", VadConfig.threshold)
         pause_threshold = resolve_neg_threshold(threshold, vad_parameters.get("neg_threshold"))
         return frame_samples, max_frames, pause_threshold
+
+    def _next_chunk(self, smoothed: np.ndarray, start_frame: int, index: int, audio_len: int) -> tuple[AudioChunk, int]:
+        """Plan the chunk starting at start_frame; returns it with its (exclusive) end frame."""
+        frame_samples, max_frames, pause_threshold = self._smart_split_frame_params()
+        end_frame, kind = find_chunk_end(
+            smoothed,
+            start_frame,
+            max_frames=max_frames,
+            split_window_factor=self.smart_split_options.split_window_factor,
+            pause_threshold=pause_threshold,
+            min_search_frames=WHISPER_SAMPLING_RATE // frame_samples,  # 1s
+        )
+        start_sample = start_frame * frame_samples
+        end_sample = audio_len if kind == CHUNK_FINAL else min(audio_len, end_frame * frame_samples)
+        chunk = AudioChunk(index, start_sample / WHISPER_SAMPLING_RATE, end_sample / WHISPER_SAMPLING_RATE, kind)
+        return chunk, end_frame
 
     def _transcribe_chunk(
         self, model, audio, chunk: AudioChunk, chunk_probs: np.ndarray | None, config: dict[str, Any]
@@ -919,9 +932,8 @@ class Inference:
             return whole_segments, SimpleNamespace(duration=duration, duration_after_vad=inner_duration or duration)
 
         speech_probs = split_input.speech_probs
-        frame_samples, max_frames, pause_threshold = self._smart_split_frame_params()
+        frame_samples = self._smart_split_frame_params()[0]
         smoothed = smooth_probs(speech_probs)
-        min_search_frames = int(round(1.0 * WHISPER_SAMPLING_RATE / frame_samples))
 
         segments: list[Segment] = []
         stats: Counter[str] = Counter()
@@ -931,23 +943,11 @@ class Inference:
         chunk_index = 0
 
         while start_frame < len(speech_probs):
-            end_frame, kind = find_chunk_end(
-                smoothed,
-                start_frame,
-                max_frames=max_frames,
-                split_window_factor=self.smart_split_options.split_window_factor,
-                pause_threshold=pause_threshold,
-                min_search_frames=min_search_frames,
-            )
-            start_sample = start_frame * frame_samples
-            end_sample = len(audio) if kind == CHUNK_FINAL else min(len(audio), end_frame * frame_samples)
-            chunk = AudioChunk(
-                chunk_index, start_sample / WHISPER_SAMPLING_RATE, end_sample / WHISPER_SAMPLING_RATE, kind
-            )
+            chunk, end_frame = self._next_chunk(smoothed, start_frame, chunk_index, len(audio))
             chunk_index += 1
-            stats[kind] += 1
+            stats[chunk.kind] += 1
 
-            if not has_speech_between(split_input.vad_segments, start_sample, end_sample):
+            if not has_speech_between(split_input.vad_segments, start_frame * frame_samples, end_frame * frame_samples):
                 stats["skipped"] += 1
                 start_frame = end_frame
                 continue
@@ -960,7 +960,7 @@ class Inference:
                 has_inner_duration = True
 
             next_start_frame = end_frame
-            if kind == CHUNK_FORCED:
+            if chunk.kind == CHUNK_FORCED:
                 # The cut may have split a word: keep only the segments that ended well before it and
                 # decode the rest again as part of the next chunk.
                 anchor = choose_anchor(
@@ -989,6 +989,133 @@ class Inference:
         )
         duration_after_vad = inner_duration_after_vad if has_inner_duration else split_input.duration_after_vad
         return segments, SimpleNamespace(duration=duration, duration_after_vad=duration_after_vad)
+
+    def _batched_config(self) -> dict[str, Any]:
+        """Config for BatchedInferencePipeline.transcribe when we provide the (speech-only) clips ourselves."""
+        config = dict(self.generation_config)
+        for key in ("clip_timestamps", "vad_parameters"):
+            config.pop(key, None)
+        config["vad_filter"] = False
+        config.setdefault("beam_size", 1)
+        config.setdefault("condition_on_previous_text", False)
+        # Don't rely on the patched default: subtitle timestamps are needed.
+        config.setdefault("without_timestamps", False)
+        return config
+
+    def _transcribe_batched(
+        self, model, batched_model, task: InferenceTask, batch_size: int
+    ) -> tuple[list[Segment], Any, int]:
+        """
+        Speed mode: decode the smart split chunks in batches.
+
+        Chunks are planned exactly like the sequential path (without re-anchoring, which needs the
+        previous chunk's result). Each chunk's speech is concatenated with the same per-chunk VAD that
+        faster_whisper would apply, and the speech-only chunks are laid out on a 30s grid so the
+        batched pipeline decodes one chunk per window. Batched decoding has no temperature fallback
+        and no seek, so chunks whose result looks unreliable are decoded again sequentially.
+
+        Returns (segments, info, batch size actually used).
+        """
+        split_input = self._prepare_smart_split(task.audio_path)
+        audio = split_input.audio
+        duration = len(audio) / WHISPER_SAMPLING_RATE
+        if split_input.duration_after_vad == 0 or split_input.speech_probs is None:
+            return [], SimpleNamespace(duration=duration, duration_after_vad=0), batch_size
+        assert self.vad_manager is not None
+
+        speech_probs = split_input.speech_probs
+        frame_samples = self._smart_split_frame_params()[0]
+        smoothed = smooth_probs(speech_probs)
+        vad_parameters = self.generation_config.get("vad_parameters") or {}
+        stats: Counter[str] = Counter()
+
+        # Plan all chunks up front and cut each one down to its speech.
+        prepared: list[tuple[AudioChunk, int, int, np.ndarray, SpeechMap]] = []
+        start_frame = 0
+        chunk_index = 0
+        while start_frame < len(speech_probs):
+            chunk, end_frame = self._next_chunk(smoothed, start_frame, chunk_index, len(audio))
+            chunk_index += 1
+            stats[chunk.kind] += 1
+            start_sample = start_frame * frame_samples
+            end_sample = int(round(chunk.end * WHISPER_SAMPLING_RATE))
+            chunk_audio = audio[start_sample:end_sample]
+            inner_segments = []
+            if has_speech_between(split_input.vad_segments, start_sample, end_sample):
+                inner_segments = self.vad_manager.get_speech_timestamps(
+                    model_id="whisper_vad",
+                    audio=chunk_audio,
+                    sampling_rate=WHISPER_SAMPLING_RATE,
+                    speech_probs=speech_probs[start_frame:end_frame],
+                    **vad_parameters,
+                )
+            speech, speech_map = concat_speech(chunk_audio, inner_segments, WHISPER_SAMPLING_RATE)
+            if len(speech) == 0:
+                stats["skipped"] += 1
+            else:
+                prepared.append((chunk, start_frame, end_frame, speech, speech_map))
+            start_frame = end_frame
+
+        config = self._batched_config()
+        sequential_config = self._smart_chunk_config()
+        compression_ratio_threshold = self.generation_config.get("compression_ratio_threshold", 2.4)
+        log_prob_threshold = self.generation_config.get("log_prob_threshold", -1.0)
+        window_s = MAX_SMART_CHUNK_DURATION_S
+        window_samples = int(window_s * WHISPER_SAMPLING_RATE)
+        segments: list[Segment] = []
+
+        group_start = 0
+        while group_start < len(prepared):
+            group = prepared[group_start : group_start + batch_size]
+            layout = np.zeros(len(group) * window_samples, dtype=np.float32)
+            clips = []
+            for k, (_chunk, _f0, _f1, speech, _map) in enumerate(group):
+                layout[k * window_samples : k * window_samples + len(speech)] = speech
+                clips.append({"start": k * window_s, "end": k * window_s + len(speech) / WHISPER_SAMPLING_RATE})
+            raw_segments, _info, batch_size = self._transcribe_with_auto_batch_size(
+                batched_model, layout, {**config, "clip_timestamps": clips}, starting_batch_size=batch_size
+            )
+
+            by_chunk: list[list[Any]] = [[] for _ in group]
+            for raw in raw_segments:
+                by_chunk[min(len(group) - 1, max(0, int(raw.start // window_s)))].append(raw)
+
+            for k, (chunk, f0, f1, _speech, speech_map) in enumerate(group):
+                spans = [(raw.start - k * window_s, raw.end - k * window_s) for raw in by_chunk[k]]
+                if needs_sequential_retry(
+                    spans,
+                    [raw.compression_ratio for raw in by_chunk[k]],
+                    [raw.avg_logprob for raw in by_chunk[k]],
+                    speech_map.duration_s,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    log_prob_threshold=log_prob_threshold,
+                ):
+                    stats["batched_fallback"] += 1
+                    chunk_segments, _duration = self._transcribe_chunk(
+                        model, audio, chunk, speech_probs[f0:f1], sequential_config
+                    )
+                    segments.extend(chunk_segments)
+                    continue
+
+                for raw, (local_start, local_end) in zip(by_chunk[k], spans, strict=True):
+                    start_ms = int(round((chunk.start + speech_map.to_original(local_start)) * 1_000))
+                    end_ms = int(round((chunk.start + speech_map.to_original(local_end, is_end=True)) * 1_000))
+                    end_ms = min(end_ms, int(round(chunk.end * 1_000)))
+                    if end_ms > start_ms:
+                        segments.append(Segment(start=start_ms, end=end_ms, text=raw.text.strip()))
+            group_start += len(group)
+
+        logger.info(
+            "Smart VAD split (batched): chunks=%s pause=%s forced=%s final=%s skipped=%s batched_fallback=%s",
+            chunk_index,
+            stats["pause"],
+            stats["forced"],
+            stats["final"],
+            stats["skipped"],
+            stats["batched_fallback"],
+        )
+        duration_after_vad = sum(speech_map.duration_s for *_rest, speech_map in prepared)
+        return segments, SimpleNamespace(duration=duration, duration_after_vad=duration_after_vad), batch_size
 
     def _transcribe_standard(self, model, audio_input, transcription_config):
         return model.transcribe(audio_input, **transcription_config)
@@ -1047,7 +1174,7 @@ class Inference:
                     if batch_size_to_use == 0 and len(tasks) > 0:
                         # Use the first audio file as sample for testing
                         batch_size_to_use = self._find_executable_batch_size(
-                            model,
+                            batched_model,
                             tasks[0].audio_path,
                             min_batch_size=1,
                             max_batch_size=self.max_batch_size,
@@ -1075,53 +1202,42 @@ class Inference:
                     )
                 )
 
-                if self._should_use_smart_split():
+                use_batched = bool(
+                    batched_model
+                    and batch_size_to_use > 0
+                    and self.vad_manager is not None
+                    and self.generation_config.get("vad_filter", True)
+                )
+                if use_batched:
+                    try:
+                        segments, info, actual_batch_size = self._transcribe_batched(
+                            model, batched_model, task, batch_size_to_use
+                        )
+                        if actual_batch_size < batch_size_to_use:
+                            logger.info(f"Batch size auto-adjusted from {batch_size_to_use} to {actual_batch_size}")
+                            batch_size_to_use = actual_batch_size
+                    except Exception as e:
+                        logger.warning(f"Batched inference failed: {str(e)}. Falling back to non-batched mode.")
+                        segments, info = self._transcribe_smart_chunks(model, task)
+                    duration_after_vad = info.duration_after_vad
+                elif self._should_use_smart_split():
                     segments, info = self._transcribe_smart_chunks(model, task)
                     duration_after_vad = info.duration_after_vad
                 else:
                     audio_input, transcription_config, manual_duration_after_vad = self._prepare_transcription(
-                        task.audio_path,
-                        batched=bool(batched_model and batch_size_to_use > 0),
+                        task.audio_path
                     )
-
-                    # Use batched or regular inference
-                    if batched_model and batch_size_to_use > 0:
-                        # Use auto-retry with batch size reduction on OOM
-                        # This mimics HuggingFace Accelerate's find_executable_batch_size behavior
-                        try:
-                            _segments, info, actual_batch_size = self._transcribe_with_auto_batch_size(
-                                batched_model,
-                                audio_input,
-                                transcription_config,
-                                starting_batch_size=batch_size_to_use,
-                            )
-                            # Update batch_size_to_use if it was auto-adjusted
-                            if actual_batch_size < batch_size_to_use:
-                                logger.info(f"Batch size auto-adjusted from {batch_size_to_use} to {actual_batch_size}")
-                                batch_size_to_use = actual_batch_size
-                        except Exception as e:
-                            logger.warning(f"Batched inference failed: {str(e)}. Falling back to non-batched mode.")
-                            # Fallback to non-batched
-                            audio_input, transcription_config, manual_duration_after_vad = self._prepare_transcription(
-                                task.audio_path,
-                                batched=False,
-                            )
-                            _segments, info = model.transcribe(
-                                audio_input,
-                                **transcription_config,
-                            )
+                    if manual_duration_after_vad == 0:
+                        _segments = []
+                        info = SimpleNamespace(
+                            duration=len(audio_input) / WHISPER_SAMPLING_RATE,
+                            duration_after_vad=0,
+                        )
                     else:
-                        if manual_duration_after_vad == 0:
-                            _segments = []
-                            info = SimpleNamespace(
-                                duration=len(audio_input) / WHISPER_SAMPLING_RATE,
-                                duration_after_vad=0,
-                            )
-                        else:
-                            _segments, info = model.transcribe(
-                                audio_input,
-                                **transcription_config,
-                            )
+                        _segments, info = model.transcribe(
+                            audio_input,
+                            **transcription_config,
+                        )
 
                     duration_after_vad = (
                         manual_duration_after_vad if manual_duration_after_vad is not None else info.duration_after_vad
@@ -1157,13 +1273,16 @@ class Inference:
                 uninject_vad()
                 logger.info(_("info.vad_deactivated"))
 
-    def _find_executable_batch_size(self, model, sample_audio_path, min_batch_size=1, max_batch_size=64):
+    def _find_executable_batch_size(self, batched_model, sample_audio_path, min_batch_size=1, max_batch_size=64):
         """
         Find the maximum executable batch size for batched inference.
         Starts from max_batch_size and works down exponentially on OOM.
 
+        Each attempt decodes exactly one full batch of 30s windows (taken from the sample file, repeated if
+        it is too short) instead of transcribing the whole file.
+
         Args:
-            model: WhisperModel instance
+            batched_model: BatchedInferencePipeline instance
             sample_audio_path: Path to a sample audio file for testing
             min_batch_size: Minimum batch size to try
             max_batch_size: Maximum batch size to try
@@ -1174,9 +1293,13 @@ class Inference:
         if not self.enable_batching:
             return 0
 
-        BatchedInferencePipelineCls = _require_faster_whisper()[1]
-
         logger.info(_("batch.finding_optimal", min_size=min_batch_size, max_size=max_batch_size))
+
+        sample_audio = decode_audio(sample_audio_path, sampling_rate=WHISPER_SAMPLING_RATE)
+        if len(sample_audio) == 0:
+            sample_audio = np.zeros(WHISPER_SAMPLING_RATE, dtype=np.float32)
+        config = self._batched_config()
+        window_s = MAX_SMART_CHUNK_DURATION_S
 
         # Start from max and work down on failure (like HuggingFace Accelerate)
         current_batch_size = max_batch_size
@@ -1185,16 +1308,13 @@ class Inference:
             try:
                 logger.info(_("batch.testing_size", size=current_batch_size))
 
-                # Try to create batched pipeline with this batch size
-                batched_model = BatchedInferencePipelineCls(model=model)
-
-                # Test transcription with this batch size
-                # Note: batch_size is passed separately to BatchedInferencePipeline.transcribe()
-                # It's NOT part of generation_config
+                probe_audio = np.resize(sample_audio, int(current_batch_size * window_s * WHISPER_SAMPLING_RATE))
+                clips = [{"start": i * window_s, "end": (i + 1) * window_s} for i in range(current_batch_size)]
                 segments, info = batched_model.transcribe(
-                    sample_audio_path,
-                    batch_size=current_batch_size,  # batch_size is a separate parameter
-                    **self.generation_config,  # generation_config doesn't include batch_size
+                    probe_audio,
+                    batch_size=current_batch_size,
+                    clip_timestamps=clips,
+                    **config,
                 )
 
                 # Force evaluation by converting to list
@@ -1262,11 +1382,11 @@ class Inference:
 
         Args:
             batched_model: BatchedInferencePipeline instance
-            audio_path: Path to audio file
+            audio_path: Path to audio file (or audio array)
             starting_batch_size: Initial batch size to try (uses self.batch_size if not specified)
 
         Returns:
-            Tuple of (segments, info, actual_batch_size_used)
+            Tuple of (segments as a list, info, actual_batch_size_used)
         """
         batch_size = starting_batch_size or self.batch_size or 32
         min_batch_size = 1
@@ -1275,8 +1395,10 @@ class Inference:
             try:
                 logger.debug(_("batch.attempting_transcription", size=batch_size))
 
-                # Try transcription with current batch size
-                segments, info = batched_model.transcribe(audio_path, batch_size=batch_size, **generation_config)
+                # Try transcription with current batch size. Decoding is lazy and that is where OOM
+                # happens, so materialize the segments inside the try.
+                segments_iter, info = batched_model.transcribe(audio_path, batch_size=batch_size, **generation_config)
+                segments = list(segments_iter)
 
                 # Success! Return results with the batch size that worked
                 if batch_size < (starting_batch_size or self.batch_size or 32):

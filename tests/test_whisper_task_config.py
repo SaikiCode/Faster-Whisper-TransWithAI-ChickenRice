@@ -111,11 +111,6 @@ class VadClipTimestampTests(unittest.TestCase):
 
         self.assertEqual(clips, [1.0, 2.0])
 
-    def test_converts_sample_indices_to_batched_clip_dicts(self) -> None:
-        clips = vad_segments_to_clip_timestamps([{"start": 16_000, "end": 32_000}], batched=True)
-
-        self.assertEqual(clips, [{"start": 1.0, "end": 2.0}])
-
     def test_prepare_transcription_uses_vad_clips_when_smart_split_disabled(self) -> None:
         inference = Inference.__new__(Inference)
         inference.generation_config = {
@@ -129,7 +124,7 @@ class VadClipTimestampTests(unittest.TestCase):
         inference.vad_manager.get_speech_timestamps.return_value = [{"start": 16_000, "end": 32_000}]
 
         with mock.patch.object(infer_module, "decode_audio", return_value=[0] * 32_000):
-            audio, config, duration_after_vad = inference._prepare_transcription("audio.mp3", batched=False)
+            audio, config, duration_after_vad = inference._prepare_transcription("audio.mp3")
 
         self.assertEqual(len(audio), 32_000)
         self.assertEqual(duration_after_vad, 1.0)
@@ -245,6 +240,131 @@ class SmartSplitTests(unittest.TestCase):
                 Segment(28_000, 39_000, "d"),
             ],
         )
+
+
+def raw_segment(start: float, end: float, text: str, compression_ratio: float = 1.2, avg_logprob: float = -0.3):
+    return mock.Mock(start=start, end=end, text=text, compression_ratio=compression_ratio, avg_logprob=avg_logprob)
+
+
+def oom_error() -> RuntimeError:
+    return RuntimeError("CUDA failed with error out of memory")
+
+
+class BatchedModeTests(unittest.TestCase):
+    def make_inference(self) -> Inference:
+        inference = Inference.__new__(Inference)
+        inference.generation_config = {
+            "language": "ja",
+            "task": "translate",
+            "vad_filter": True,
+            "vad_parameters": {"threshold": 0.5},
+        }
+        inference.smart_split_options = infer_module.SmartSplitOptions(enabled=True, target_chunk_duration_s=2.0)
+        inference.enable_batching = True
+        inference.batch_size = 0
+
+        # Same 5s layout as the sequential test: speech 0-1s and 3-4s, chunks [0, 1.6) and [2.88, 4.48) have speech.
+        probs = np.full(250, 0.05, dtype=np.float32)
+        probs[0:50] = 0.9
+        probs[150:200] = 0.9
+
+        def get_speech_timestamps(model_id, audio, sampling_rate, speech_probs, **kwargs):
+            if len(audio) == 80_000:
+                return [{"start": 0, "end": 16_000}, {"start": 48_000, "end": 64_000}]
+            if speech_probs[0] > 0.5:  # chunk starting at 0s: speech at 0-1s
+                return [{"start": 0, "end": 16_000}]
+            return [{"start": 1_920, "end": 17_920}]  # chunk starting at 2.88s: speech at 3-4s
+
+        inference.vad_manager = mock.Mock(frame_duration_ms=20)
+        inference.vad_manager.get_speech_probs.return_value = probs
+        inference.vad_manager.get_speech_timestamps.side_effect = get_speech_timestamps
+        return inference
+
+    def run_batched(self, inference: Inference, batched_model, model=None):
+        with mock.patch.object(infer_module, "decode_audio", return_value=np.zeros(80_000, dtype=np.float32)):
+            return inference._transcribe_batched(model or mock.Mock(), batched_model, mock.Mock(audio_path="a.mp3"), 4)
+
+    def test_speech_only_chunks_are_batched_on_a_30s_grid_and_mapped_back(self) -> None:
+        batched_model = mock.Mock()
+        batched_model.transcribe.return_value = (
+            [raw_segment(0.0, 1.0, "one"), raw_segment(30.0, 31.0, "two")],
+            mock.Mock(),
+        )
+
+        segments, info, batch_size = self.run_batched(self.make_inference(), batched_model)
+
+        batched_model.transcribe.assert_called_once()
+        layout = batched_model.transcribe.call_args.args[0]
+        kwargs = batched_model.transcribe.call_args.kwargs
+        self.assertEqual(len(layout), 2 * 30 * 16_000)
+        self.assertEqual(kwargs["clip_timestamps"], [{"start": 0.0, "end": 1.0}, {"start": 30.0, "end": 31.0}])
+        self.assertEqual(kwargs["batch_size"], 4)
+        self.assertFalse(kwargs["vad_filter"])
+        self.assertFalse(kwargs["without_timestamps"])
+        self.assertNotIn("vad_parameters", kwargs)
+        # Chunk 2 starts at 2.88s and its speech starts 0.12s in, so "two" is at 3-4s in the original audio.
+        self.assertEqual(segments, [Segment(0, 1_000, "one"), Segment(3_000, 4_000, "two")])
+        self.assertEqual(info.duration_after_vad, 2.0)
+        self.assertEqual(batch_size, 4)
+
+    def test_unreliable_chunks_are_decoded_again_sequentially(self) -> None:
+        batched_model = mock.Mock()
+        # Chunk 1 decodes fine; chunk 2 comes back empty although it has 1s of speech.
+        batched_model.transcribe.return_value = ([raw_segment(0.0, 1.0, "one")], mock.Mock())
+        model = mock.Mock()
+        model.transcribe.return_value = ([raw_segment(0.12, 1.12, "two (sequential)")], mock.Mock(duration_after_vad=1))
+
+        segments, _info, _batch_size = self.run_batched(self.make_inference(), batched_model, model)
+
+        model.transcribe.assert_called_once()
+        chunk_audio = model.transcribe.call_args.args[0]
+        self.assertEqual(len(chunk_audio), 25_600)  # the whole [2.88s, 4.48s) chunk
+        self.assertTrue(model.transcribe.call_args.kwargs["vad_filter"])
+        self.assertEqual(segments, [Segment(0, 1_000, "one"), Segment(3_000, 4_000, "two (sequential)")])
+
+    def test_oom_while_decoding_lazily_reduces_batch_size(self) -> None:
+        def transcribe(audio, batch_size, **config):
+            def segments():
+                if batch_size > 2:
+                    raise oom_error()
+                yield raw_segment(0.0, 1.0, "ok")
+
+            return segments(), mock.Mock()
+
+        batched_model = mock.Mock()
+        batched_model.transcribe.side_effect = transcribe
+
+        segments, _info, batch_size = Inference.__new__(Inference)._transcribe_with_auto_batch_size(
+            batched_model, np.zeros(16_000), {}, starting_batch_size=4
+        )
+
+        self.assertEqual([call.kwargs["batch_size"] for call in batched_model.transcribe.call_args_list], [4, 3, 2])
+        self.assertEqual(batch_size, 2)
+        self.assertEqual([segment.text for segment in segments], ["ok"])
+
+    def test_probe_decodes_one_full_batch_per_attempt(self) -> None:
+        def transcribe(audio, batch_size, clip_timestamps, **config):
+            def segments():
+                if batch_size > 2:
+                    raise oom_error()
+                yield raw_segment(0.0, 1.0, "ok")
+
+            return segments(), mock.Mock()
+
+        batched_model = mock.Mock()
+        batched_model.transcribe.side_effect = transcribe
+        inference = self.make_inference()
+
+        with mock.patch.object(infer_module, "decode_audio", return_value=np.ones(5 * 16_000, dtype=np.float32)):
+            batch_size = inference._find_executable_batch_size(batched_model, "a.mp3", 1, 4)
+
+        self.assertEqual(batch_size, 2)
+        for call in batched_model.transcribe.call_args_list:
+            n = call.kwargs["batch_size"]
+            self.assertEqual(len(call.args[0]), n * 30 * 16_000)
+            self.assertEqual(len(call.kwargs["clip_timestamps"]), n)
+            self.assertFalse(call.kwargs["vad_filter"])
+        self.assertEqual([call.kwargs["batch_size"] for call in batched_model.transcribe.call_args_list], [4, 2])
 
 
 if __name__ == "__main__":

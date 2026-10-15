@@ -11,7 +11,9 @@ from faster_whisper_transwithai_chickenrice.smart_split import (
     CHUNK_FORCED,
     CHUNK_PAUSE,
     choose_anchor,
+    concat_speech,
     find_chunk_end,
+    needs_sequential_retry,
     smooth_probs,
 )
 
@@ -108,6 +110,71 @@ class ChooseAnchorTests(unittest.TestCase):
     def test_anchor_always_moves_forward(self) -> None:
         anchor_frame, _keep_until = self.anchor([35.1, 59.0], speech(90), start_s=30.0, cut_s=60.0)
         self.assertGreaterEqual(anchor_frame, 35 * FRAMES_PER_S)
+
+
+class ConcatSpeechTests(unittest.TestCase):
+    def test_concatenates_speech_and_maps_times_back(self) -> None:
+        audio = np.arange(10 * 16_000, dtype=np.float32)
+        speech, speech_map = concat_speech(
+            audio, [{"start": 16_000, "end": 32_000}, {"start": 80_000, "end": 112_000}], 16_000
+        )
+        self.assertEqual(len(speech), 48_000)
+        self.assertEqual(speech[0], 16_000)
+        self.assertEqual(speech[16_000], 80_000)
+        self.assertEqual(speech_map.duration_s, 3.0)
+        self.assertEqual(speech_map.to_original(0.5), 1.5)
+        self.assertEqual(speech_map.to_original(1.5), 5.5)
+        # The join at 1.0s is the end of the first piece or the start of the second.
+        self.assertEqual(speech_map.to_original(1.0, is_end=True), 2.0)
+        self.assertEqual(speech_map.to_original(1.0), 5.0)
+        self.assertEqual(speech_map.to_original(99.0), 7.0)
+
+    def test_merges_overlapping_segments_and_clips_to_audio(self) -> None:
+        audio = np.zeros(16_000, dtype=np.float32)
+        speech, speech_map = concat_speech(
+            audio, [{"start": 8_000, "end": 20_000}, {"start": 0, "end": 4_000}, {"start": 3_000, "end": 6_000}], 16_000
+        )
+        self.assertEqual(len(speech), 6_000 + 8_000)
+        self.assertEqual(speech_map.orig_starts, (0.0, 0.5))
+
+    def test_no_speech(self) -> None:
+        speech, speech_map = concat_speech(np.zeros(100, dtype=np.float32), [], 16_000)
+        self.assertEqual(len(speech), 0)
+        self.assertEqual(speech_map.duration_s, 0.0)
+
+
+class NeedsSequentialRetryTests(unittest.TestCase):
+    def check(self, spans, speech_s, ratios=None, logprobs=None) -> bool:
+        return needs_sequential_retry(
+            spans,
+            ratios if ratios is not None else [1.5] * len(spans),
+            logprobs if logprobs is not None else [-0.3] * len(spans),
+            speech_s,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+        )
+
+    def test_good_decode_is_kept(self) -> None:
+        self.assertFalse(self.check([(0.0, 9.5), (9.8, 20.0)], 20.0))
+
+    def test_repetition_or_low_confidence_triggers_retry(self) -> None:
+        self.assertTrue(self.check([(0.0, 20.0)], 20.0, ratios=[3.1]))
+        self.assertTrue(self.check([(0.0, 20.0)], 20.0, logprobs=[-1.4]))
+
+    def test_early_stop_triggers_retry(self) -> None:
+        self.assertTrue(self.check([(0.0, 12.0)], 20.0))  # 8s of speech never decoded
+        self.assertFalse(self.check([(0.0, 3.4)], 4.0))  # 0.6s uncovered is within tolerance
+
+    def test_empty_output_retries_only_for_real_speech(self) -> None:
+        self.assertTrue(self.check([], 2.0))
+        self.assertFalse(self.check([], 0.5))
+
+    def test_thresholds_can_be_disabled(self) -> None:
+        self.assertFalse(
+            needs_sequential_retry(
+                [(0.0, 5.0)], [9.9], [-9.9], 5.0, compression_ratio_threshold=None, log_prob_threshold=None
+            )
+        )
 
 
 class SmoothProbsTests(unittest.TestCase):
