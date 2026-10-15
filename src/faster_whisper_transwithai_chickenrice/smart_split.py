@@ -245,22 +245,30 @@ def needs_sequential_retry(
     *,
     compression_ratio_threshold: float | None,
     log_prob_threshold: float | None,
-) -> bool:
+) -> str | None:
     """
-    Whether a batched (single-pass) decode of a chunk looks unreliable.
+    Why a batched (single-pass) decode of a chunk looks unreliable, or None if it looks fine.
 
     Batched decoding has no temperature fallback and no seek, so a repetition loop, a low-confidence
     decode or an early stop silently loses speech. spans are the segment times in the chunk's
     speech-only timeline.
     """
     if not spans:
-        return speech_duration_s >= MIN_SPEECH_FOR_EMPTY_OUTPUT_S
-    if compression_ratio_threshold is not None and any(r > compression_ratio_threshold for r in compression_ratios):
-        return True
-    if log_prob_threshold is not None and any(p < log_prob_threshold for p in avg_logprobs):
-        return True
+        if speech_duration_s >= MIN_SPEECH_FOR_EMPTY_OUTPUT_S:
+            return f"no output for {speech_duration_s:.1f}s of speech"
+        return None
+    if compression_ratio_threshold is not None:
+        worst = max(compression_ratios, default=0.0)
+        if worst > compression_ratio_threshold:
+            return f"compression_ratio {worst:.2f} > {compression_ratio_threshold} (repetition)"
+    if log_prob_threshold is not None:
+        lowest = min(avg_logprobs, default=0.0)
+        if lowest < log_prob_threshold:
+            return f"avg_logprob {lowest:.2f} < {log_prob_threshold}"
     uncovered = speech_duration_s - _covered_duration(spans, speech_duration_s)
-    return uncovered > max(MIN_UNCOVERED_SPEECH_S, MAX_UNCOVERED_SPEECH_RATIO * speech_duration_s)
+    if uncovered > max(MIN_UNCOVERED_SPEECH_S, MAX_UNCOVERED_SPEECH_RATIO * speech_duration_s):
+        return f"{uncovered:.1f}s of {speech_duration_s:.1f}s speech not covered"
+    return None
 
 
 def _text_cut_positions(text: str) -> list[int]:
@@ -274,6 +282,35 @@ def _text_cut_positions(text: str) -> list[int]:
     return sorted(p for p in positions if 0 < p < len(text))
 
 
+def _char_count(text: str) -> int:
+    return sum(1 for char in text if not char.isspace())
+
+
+def _assign_text(text: str, stretches: Sequence[Sequence[float]]) -> list[tuple[int, int, str]]:
+    """
+    Cut text into (first stretch, last stretch, text) parts, as close as possible to each stretch's
+    share of the speech; stretches that cannot get their own text stay joined with the previous one.
+    """
+    total_speech = sum(st[2] for st in stretches)
+    cuts = _text_cut_positions(text)
+    parts: list[tuple[int, int, str]] = []
+    first = 0
+    prev_cut = 0
+    speech_before = 0.0
+    for k in range(len(stretches) - 1):
+        speech_before += stretches[k][2]
+        candidates = [p for p in cuts if p > prev_cut and text[prev_cut:p].strip() and text[p:].strip()]
+        if not candidates:
+            break
+        target = len(text) * speech_before / total_speech
+        cut = min(candidates, key=lambda p: (abs(p - target), p))
+        parts.append((first, k, text[prev_cut:cut].strip()))
+        prev_cut = cut
+        first = k + 1
+    parts.append((first, len(stretches) - 1, text[prev_cut:].strip()))
+    return parts
+
+
 def split_at_pauses(
     start_s: float,
     end_s: float,
@@ -282,6 +319,7 @@ def split_at_pauses(
     *,
     min_pause_s: float,
     min_part_speech_s: float = 0.3,
+    max_rate_ratio: float = 2.0,
 ) -> list[tuple[float, float, str]]:
     """
     Split a subtitle segment that runs across long pauses into one segment per stretch of speech.
@@ -290,7 +328,10 @@ def split_at_pauses(
     together than min_pause_s form one stretch; stretches with less than min_part_speech_s of speech
     are dropped (the segment is trimmed instead of split). The text is cut at whitespace or clause
     punctuation, as close as possible to each stretch's share of the speech; stretches that cannot get
-    their own text stay joined with the previous one. A segment that covers no speech is returned as is.
+    their own text stay joined with the previous one. A part whose text would be spoken more than
+    max_rate_ratio times faster than the segment's average (a few words flashed over a short stretch)
+    means the cut does not fit the speech: its shortest stretch is dropped and the text cut again.
+    A segment that covers no speech is returned as is.
     """
     spans = [(max(s, start_s), min(e, end_s)) for s, e in speech_pieces if min(e, end_s) > max(s, start_s)]
     if not spans:
@@ -306,21 +347,18 @@ def split_at_pauses(
     if len(stretches) > 1:
         stretches = [st for st in stretches if st[2] >= min_part_speech_s] or [max(stretches, key=lambda st: st[2])]
 
-    total_speech = sum(st[2] for st in stretches)
-    cuts = _text_cut_positions(text)
-    parts: list[tuple[float, float, str]] = []
-    part_start = stretches[0][0]
-    prev_cut = 0
-    speech_before = 0.0
-    for k in range(len(stretches) - 1):
-        speech_before += stretches[k][2]
-        candidates = [p for p in cuts if p > prev_cut and text[prev_cut:p].strip() and text[p:].strip()]
-        if not candidates:
+    while True:
+        parts = _assign_text(text, stretches)
+        if len(parts) == 1:
             break
-        target = len(text) * speech_before / total_speech
-        cut = min(candidates, key=lambda p: (abs(p - target), p))
-        parts.append((part_start, stretches[k][1], text[prev_cut:cut].strip()))
-        prev_cut = cut
-        part_start = stretches[k + 1][0]
-    parts.append((part_start, stretches[-1][1], text[prev_cut:].strip()))
-    return parts
+        average_rate = _char_count(text) / sum(st[2] for st in stretches)
+        rates = [
+            (_char_count(part_text) / sum(st[2] for st in stretches[first : last + 1]), first, last)
+            for first, last, part_text in parts
+        ]
+        worst_rate, first, last = max(rates)
+        if worst_rate <= max_rate_ratio * average_rate:
+            break
+        del stretches[min(range(first, last + 1), key=lambda i: stretches[i][2])]
+
+    return [(stretches[first][0], stretches[last][1], part_text) for first, last, part_text in parts]

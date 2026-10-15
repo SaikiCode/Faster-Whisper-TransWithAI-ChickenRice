@@ -12,6 +12,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 import traceback
 import unicodedata
 from bisect import bisect_right
@@ -762,6 +763,8 @@ class Inference:
                         ),
                     )
                 config = dict(**ChainMap(file_config, config))
+        else:
+            logger.warning(_("warnings.generation_config_not_found", path=os.path.abspath(args.generation_config)))
 
         config["task"] = _normalize_whisper_task(args.task if args.task is not None else config.get("task"))
 
@@ -1226,17 +1229,27 @@ class Inference:
 
             for k, (chunk, f0, f1, _speech, speech_map) in enumerate(group):
                 spans = [(raw.start - k * window_s, raw.end - k * window_s) for raw in by_chunk[k]]
-                if needs_sequential_retry(
+                retry_reason = needs_sequential_retry(
                     [(speech_map.to_speech_time(start), speech_map.to_speech_time(end)) for start, end in spans],
                     [raw.compression_ratio for raw in by_chunk[k]],
                     [raw.avg_logprob for raw in by_chunk[k]],
                     speech_map.duration_s,
                     compression_ratio_threshold=compression_ratio_threshold,
                     log_prob_threshold=log_prob_threshold,
-                ):
+                )
+                if retry_reason:
                     stats["batched_fallback"] += 1
+                    retry_started = time.perf_counter()
                     chunk_segments, _duration = self._transcribe_chunk(
                         model, audio, chunk, speech_probs[f0:f1], sequential_config
+                    )
+                    logger.info(
+                        "Batched chunk %s (%s --> %s) decoded again sequentially in %.1fs: %s",
+                        chunk.index + 1,
+                        SubWriter.lrc_timestamp(int(round(chunk.start * 1_000))),
+                        SubWriter.lrc_timestamp(int(round(chunk.end * 1_000))),
+                        time.perf_counter() - retry_started,
+                        retry_reason,
                     )
                     segments.extend(chunk_segments)
                     continue

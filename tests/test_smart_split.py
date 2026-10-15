@@ -200,6 +200,21 @@ class SplitAtPausesTests(unittest.TestCase):
     def test_text_without_cut_positions_is_not_split(self) -> None:
         self.assertEqual(self.split(0.0, 6.0, "一二三四五六", [(0.0, 2.0), (4.0, 6.0)]), [(0.0, 6.0, "一二三四五六")])
 
+    def test_part_too_fast_for_its_speech_is_not_split_off(self) -> None:
+        # The only cut point would put 6 of 13 characters on 0.46s of speech: keep the text whole on
+        # the main stretch instead of flashing it (the 00:26-00:33 case).
+        self.assertEqual(
+            self.split(26.66, 33.92, "看来是累坏了呢 那就没办法了", [(26.66, 29.88), (33.46, 33.92)]),
+            [(26.66, 29.88, "看来是累坏了呢 那就没办法了")],
+        )
+
+    def test_only_the_stretch_that_does_not_fit_is_dropped(self) -> None:
+        # The middle 0.4s stretch would get "四五六七" (10 chars/s vs about 1 on average); the others still split.
+        self.assertEqual(
+            self.split(0.0, 13.0, "一二三 四五六七 八九十", [(0.0, 3.0), (5.0, 5.4), (7.0, 13.0)]),
+            [(0.0, 3.0, "一二三"), (7.0, 13.0, "四五六七 八九十")],
+        )
+
     def test_segment_without_speech_is_returned_as_is(self) -> None:
         self.assertEqual(self.split(1.0, 2.0, "a b", []), [(1.0, 2.0, "a b")])
 
@@ -219,11 +234,11 @@ class NeedsSequentialRetryTests(unittest.TestCase):
         self.assertFalse(self.check([(0.0, 9.5), (9.8, 20.0)], 20.0))
 
     def test_repetition_or_low_confidence_triggers_retry(self) -> None:
-        self.assertTrue(self.check([(0.0, 20.0)], 20.0, ratios=[3.1]))
-        self.assertTrue(self.check([(0.0, 20.0)], 20.0, logprobs=[-1.4]))
+        self.assertEqual(self.check([(0.0, 20.0)], 20.0, ratios=[3.1]), "compression_ratio 3.10 > 2.4 (repetition)")
+        self.assertEqual(self.check([(0.0, 20.0)], 20.0, logprobs=[-1.4]), "avg_logprob -1.40 < -1.0")
 
     def test_early_stop_triggers_retry(self) -> None:
-        self.assertTrue(self.check([(0.0, 12.0)], 20.0))  # 8s of speech never decoded
+        self.assertEqual(self.check([(0.0, 12.0)], 20.0), "8.0s of 20.0s speech not covered")
         self.assertFalse(self.check([(0.0, 3.4)], 4.0))  # 0.6s uncovered is within tolerance
 
     def test_empty_output_retries_only_for_real_speech(self) -> None:

@@ -75,6 +75,7 @@
     "failed_load_vad": "Failed to load VAD metadata from {path}: {error}",
     "using_default_vad": "Using default VAD configuration",
     "vad_file_not_found": "VAD metadata file not found at {path}",
+    "generation_config_not_found": "Generation config file not found at {path}; using built-in defaults (its temperature fallback, VAD parameters etc. do not apply)",
     "compute_types_unavailable": "Could not get supported compute types for {device}: {error}",
     "no_preferred_compute_type": "No preferred compute type found, using default '{default}'"
   },

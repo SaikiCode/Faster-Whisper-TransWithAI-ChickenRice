@@ -5,6 +5,7 @@ Includes CUDA runtime libraries for GPU acceleration
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -298,6 +299,12 @@ def build():
                 print(f"  ⚠ Missing libraries: {', '.join(missing_libs)}")
                 print("     Note: The PyInstaller hooks should have included these.")
                 print("     If GPU acceleration doesn't work, check your conda environment.")
+
+            # Like the CI release: the config sits next to infer.exe, which reads it from its own directory.
+            config_file = Path("generation_config.json5")
+            if config_file.exists():
+                shutil.copy2(config_file, dist_dir / config_file.name)
+                print(f"  ✓ Copied {config_file.name}")
 
             print(f"\nBuild complete! Output in: {dist_dir}")
         else:

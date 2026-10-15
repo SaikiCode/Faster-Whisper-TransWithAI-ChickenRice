@@ -71,9 +71,12 @@ class WhisperTaskConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "missing.json5"
             inference = Inference.__new__(Inference)
-            config, *_options = inference._load_generation_config(make_args(config_path))
+            with self.assertLogs(infer_module.logger, "WARNING") as logs:
+                config, *_options = inference._load_generation_config(make_args(config_path))
 
         self.assertEqual(config["task"], "translate")
+        # A missing config silently drops its temperature/VAD settings, so say where it was looked for.
+        self.assertIn(str(config_path), logs.output[0])
 
     def test_subtitle_cleanup_options_are_read_and_not_passed_to_whisper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -420,8 +423,12 @@ class BatchedModeTests(unittest.TestCase):
         model = mock.Mock()
         model.transcribe.return_value = ([raw_segment(0.12, 1.12, "two (sequential)")], mock.Mock(duration_after_vad=1))
 
-        segments, _info, _batch_size = self.run_batched(self.make_inference(), batched_model, model)
+        with self.assertLogs(infer_module.logger, "INFO") as logs:
+            segments, _info, _batch_size = self.run_batched(self.make_inference(), batched_model, model)
 
+        retry_logs = [line for line in logs.output if "decoded again sequentially" in line]
+        self.assertEqual(len(retry_logs), 1)
+        self.assertIn("no output for 1.0s of speech", retry_logs[0])
         model.transcribe.assert_called_once()
         chunk_audio = model.transcribe.call_args.args[0]
         self.assertEqual(len(chunk_audio), 25_600)  # the whole [2.88s, 4.48s) chunk

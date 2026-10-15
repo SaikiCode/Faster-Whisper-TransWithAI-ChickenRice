@@ -75,6 +75,7 @@
     "failed_load_vad": "无法从 {path} 加载VAD元数据：{error}",
     "using_default_vad": "使用默认VAD配置",
     "vad_file_not_found": "在 {path} 未找到VAD元数据文件",
+    "generation_config_not_found": "未找到生成配置文件 {path}，将使用内置默认参数（温度回退、VAD参数等均不会生效）",
     "compute_types_unavailable": "无法获取设备 {device} 支持的计算类型：{error}",
     "no_preferred_compute_type": "未找到首选计算类型，使用默认值 '{default}'"
   },
