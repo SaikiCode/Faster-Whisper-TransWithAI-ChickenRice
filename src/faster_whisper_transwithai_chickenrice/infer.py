@@ -89,6 +89,12 @@ def parse_arguments():
     parser.add_argument("--model_name_or_path", type=str, default="models", help=_("args.model_path"))
     parser.add_argument("--device", type=str, default="auto", help=_("args.device"))
     parser.add_argument("--compute_type", type=str, default="auto", help=_("args.compute_type"))
+    parser.add_argument(
+        "--cpu_threads",
+        type=int,
+        default=0,
+        help="CPU threads for Whisper and VAD when running on CPU (0 = auto, about the physical core count)",
+    )
     parser.add_argument("--overwrite", action="store_true", default=False, help=_("args.overwrite"))
     parser.add_argument(
         "--audio_suffixes",
@@ -199,6 +205,29 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def resolve_device(device: str) -> str:
+    """Normalize the device name and resolve 'auto' to the device CTranslate2 will actually use."""
+    # Normalize and accept friendly aliases.
+    device = (device or "auto").strip().lower()
+    if device in {"amd", "rocm", "hip"}:
+        return "cuda"  # HIP builds still use the public device name "cuda".
+    if device != "auto":
+        return device
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible in {"", "-1"}:
+        return "cpu"
+    try:
+        return "cuda" if _require_ctranslate2().get_cuda_device_count() > 0 else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def default_cpu_threads() -> int:
+    """Approximate the physical core count (logical cores / 2 for SMT CPUs)."""
+    return max(1, (os.cpu_count() or 8) // 2)
+
+
 def select_best_compute_type(device: str) -> str:
     """
     Automatically select the best compute type based on device and available types.
@@ -215,22 +244,8 @@ def select_best_compute_type(device: str) -> str:
     """
     ct2 = _require_ctranslate2()
 
-    # Normalize and accept friendly aliases.
-    device = (device or "auto").strip().lower()
-    if device in {"amd", "rocm", "hip"}:
-        device = "cuda"  # HIP builds still use the public device name "cuda".
-
-    # Determine the actual device if 'auto' is specified.
-    actual_device = device
-    if device == "auto":
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if cuda_visible in {"", "-1"}:
-            actual_device = "cpu"
-        else:
-            try:
-                actual_device = "cuda" if ct2.get_cuda_device_count() > 0 else "cpu"
-            except Exception:
-                actual_device = "cpu"
+    actual_device = resolve_device(device)
+    if (device or "auto").strip().lower() == "auto":
         logger.info(_("info.auto_detected_device").format(device=actual_device))
 
     # Get supported compute types for the device.
@@ -580,6 +595,17 @@ class Inference:
         else:
             self.compute_type = args.compute_type
 
+        # CTranslate2 only uses 4 CPU threads by default; use the physical cores on CPU.
+        requested_cpu_threads = getattr(args, "cpu_threads", 0) or 0
+        if requested_cpu_threads > 0:
+            self.cpu_threads = requested_cpu_threads
+        elif resolve_device(self.device) == "cpu":
+            self.cpu_threads = default_cpu_threads()
+        else:
+            self.cpu_threads = 0
+        if self.cpu_threads:
+            logger.info("CPU threads: %s", self.cpu_threads)
+
         # Batch inference settings
         self.enable_batching = args.enable_batching
         self.batch_size = args.batch_size if args.batch_size else 0
@@ -817,7 +843,7 @@ class Inference:
 
         # Hardcoded runtime configuration
         vad_config.force_cpu = False
-        vad_config.num_threads = 8
+        vad_config.num_threads = self.cpu_threads or default_cpu_threads()
 
         # Inject VAD with progress callback
         self.vad_manager = VadModelManager(
@@ -991,6 +1017,7 @@ class Inference:
                 self.model_name_or_path,
                 device=self.device,
                 compute_type=self.compute_type,
+                cpu_threads=self.cpu_threads,
             )
             logger.info(_("info.model_precision").format(precision=self.compute_type, device=self.device))
 

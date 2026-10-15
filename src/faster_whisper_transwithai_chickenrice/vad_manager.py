@@ -121,6 +121,8 @@ class WhisperVADOnnxWrapper:
 
         # Set up ONNX Runtime session
         opts = ort.SessionOptions()
+        # The graph runs sequentially, so inter-op threads are never used; parallelism comes from intra-op threads.
+        opts.inter_op_num_threads = 1
 
         # Determine execution provider first
         providers = ["CPUExecutionProvider"]
@@ -130,7 +132,6 @@ class WhisperVADOnnxWrapper:
             providers.insert(0, "CUDAExecutionProvider")
             self.device = "GPU (CUDA)"
             # For GPU, use the provided num_threads or default
-            opts.inter_op_num_threads = num_threads
             opts.intra_op_num_threads = num_threads
         else:
             self.device = "CPU"
@@ -140,12 +141,10 @@ class WhisperVADOnnxWrapper:
             if num_threads == 1:
                 # Use half of CPU count for optimal performance
                 optimal_threads = max(1, multiprocessing.cpu_count() // 2)
-                opts.inter_op_num_threads = optimal_threads
                 opts.intra_op_num_threads = optimal_threads
                 logger.info(_("vad.auto_configured", threads=optimal_threads, total=multiprocessing.cpu_count()))
             else:
                 # Use user-specified thread count
-                opts.inter_op_num_threads = num_threads
                 opts.intra_op_num_threads = num_threads
 
         self.session = ort.InferenceSession(model_path, providers=providers, sess_options=opts)

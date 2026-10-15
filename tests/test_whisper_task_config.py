@@ -80,6 +80,31 @@ class WhisperTaskConfigTests(unittest.TestCase):
         self.assertEqual(config["task"], "translate")
 
 
+class DeviceResolutionTests(unittest.TestCase):
+    def test_amd_aliases_map_to_cuda(self) -> None:
+        for alias in ("amd", "ROCm", " hip "):
+            self.assertEqual(infer_module.resolve_device(alias), "cuda")
+
+    def test_auto_uses_cpu_when_cuda_hidden(self) -> None:
+        with mock.patch.dict(infer_module.os.environ, {"CUDA_VISIBLE_DEVICES": "-1"}):
+            self.assertEqual(infer_module.resolve_device("auto"), "cpu")
+
+    def test_auto_detects_cuda_devices(self) -> None:
+        fake_ct2 = mock.Mock()
+        fake_ct2.get_cuda_device_count.return_value = 1
+        with (
+            mock.patch.dict(infer_module.os.environ, {"CUDA_VISIBLE_DEVICES": "0"}),
+            mock.patch.object(infer_module, "ctranslate2", fake_ct2),
+        ):
+            self.assertEqual(infer_module.resolve_device("auto"), "cuda")
+
+    def test_default_cpu_threads_is_half_of_logical_cores(self) -> None:
+        with mock.patch.object(infer_module.os, "cpu_count", return_value=16):
+            self.assertEqual(infer_module.default_cpu_threads(), 8)
+        with mock.patch.object(infer_module.os, "cpu_count", return_value=1):
+            self.assertEqual(infer_module.default_cpu_threads(), 1)
+
+
 class VadClipTimestampTests(unittest.TestCase):
     def test_converts_sample_indices_to_clip_timestamp_pairs(self) -> None:
         clips = vad_segments_to_clip_timestamps([{"start": 16_000, "end": 32_000}])
