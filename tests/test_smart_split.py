@@ -10,6 +10,7 @@ from faster_whisper_transwithai_chickenrice.smart_split import (
     CHUNK_FINAL,
     CHUNK_FORCED,
     CHUNK_PAUSE,
+    choose_anchor,
     find_chunk_end,
     smooth_probs,
 )
@@ -83,6 +84,30 @@ class FindChunkEndTests(unittest.TestCase):
         self.assertEqual(kind, CHUNK_PAUSE)
         self.assertGreaterEqual(end, 2500)
         self.assertLess(end, 2550)
+
+
+class ChooseAnchorTests(unittest.TestCase):
+    def anchor(self, ends: list[float], probs: np.ndarray, start_s: float = 0.0, cut_s: float = 30.0):
+        return choose_anchor(ends, start_s, cut_s, smooth_probs(probs), 1 / FRAMES_PER_S)
+
+    def test_restarts_after_last_segment_that_ended_before_the_cut(self) -> None:
+        probs = speech(60)
+        probs[1450] = 0.4  # breath right after the 28.9s segment end
+        # 30.0 is the segment clipped at the cut: it is not complete, so it is not a candidate.
+        self.assertEqual(self.anchor([7.5, 12.0, 28.9, 30.0], probs), (1450, 28.9))
+
+    def test_anchor_stays_close_to_segment_end_on_flat_speech(self) -> None:
+        anchor_frame, keep_until = self.anchor([20.0, 30.0], speech(60))
+        self.assertEqual(keep_until, 20.0)
+        self.assertEqual(anchor_frame, 1000)
+
+    def test_no_anchor_without_a_complete_segment_far_enough_into_the_chunk(self) -> None:
+        self.assertIsNone(self.anchor([2.0, 4.9, 29.8], speech(60)))
+        self.assertIsNone(self.anchor([], speech(60)))
+
+    def test_anchor_always_moves_forward(self) -> None:
+        anchor_frame, _keep_until = self.anchor([35.1, 59.0], speech(90), start_s=30.0, cut_s=60.0)
+        self.assertGreaterEqual(anchor_frame, 35 * FRAMES_PER_S)
 
 
 class SmoothProbsTests(unittest.TestCase):

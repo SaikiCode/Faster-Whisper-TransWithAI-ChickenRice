@@ -205,6 +205,47 @@ class SmartSplitTests(unittest.TestCase):
         self.assertTrue(np.array_equal(model.probs_seen[1], probs[144:224]))
         self.assertIsNone(injection_module._precomputed_speech_probs)
 
+    def test_forced_cut_restarts_next_chunk_after_last_complete_segment(self) -> None:
+        inference = Inference.__new__(Inference)
+        inference.generation_config = {"language": "ja", "vad_filter": True, "vad_parameters": {"threshold": 0.5}}
+        inference.smart_split_options = infer_module.SmartSplitOptions(enabled=True)
+        # 40s of continuous speech with a single breath at 26s: no pause, so the first cut is forced at 26s.
+        probs = np.full(2_000, 0.9, dtype=np.float32)
+        probs[1_300] = 0.5
+        inference.vad_manager = mock.Mock(frame_duration_ms=20)
+        inference.vad_manager.get_speech_probs.return_value = probs
+        inference.vad_manager.get_speech_timestamps.return_value = [{"start": 0, "end": 640_000}]
+
+        def seg(start: float, end: float, text: str):
+            return mock.Mock(start=start, end=end, text=text)
+
+        responses = [
+            # Chunk [0, 26s): the last sentence is cut off at the chunk end.
+            [seg(0.0, 10.0, "a"), seg(10.0, 20.0, "b"), seg(20.5, 27.0, "c (cut)")],
+            # Chunk [20s, 40s): restarted after "b", so "c" is decoded whole.
+            [seg(0.5, 7.0, "c"), seg(8.0, 19.0, "d")],
+        ]
+        calls = []
+
+        class FakeModel:
+            def transcribe(self, audio, **config):
+                calls.append(len(audio))
+                return responses[len(calls) - 1], mock.Mock(duration_after_vad=len(audio) / 16_000)
+
+        with mock.patch.object(infer_module, "decode_audio", return_value=np.zeros(640_000, dtype=np.float32)):
+            segments, _info = inference._transcribe_smart_chunks(FakeModel(), mock.Mock(audio_path="audio.mp3"))
+
+        self.assertEqual(calls, [26 * 16_000, 20 * 16_000])
+        self.assertEqual(
+            segments,
+            [
+                Segment(0, 10_000, "a"),
+                Segment(10_000, 20_000, "b"),
+                Segment(20_500, 27_000, "c"),
+                Segment(28_000, 39_000, "d"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

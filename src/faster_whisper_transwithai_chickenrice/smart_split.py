@@ -86,7 +86,45 @@ def find_chunk_end(
         if cut is not None:
             return cut, CHUNK_PAUSE
 
-    # Smoothing turns a short dip into a flat valley; cut in the middle of it rather than at its edge.
-    zone = smoothed[zone_start:window_end]
-    lowest = np.flatnonzero(zone <= zone.min() + 1e-6)
-    return zone_start + int(lowest[len(lowest) // 2]), CHUNK_FORCED
+    return zone_start + _middle_of_lowest(smoothed[zone_start:window_end]), CHUNK_FORCED
+
+
+def _middle_of_lowest(values: np.ndarray) -> int:
+    """Index of the lowest value; smoothing turns a short dip into a flat valley, so take its middle."""
+    lowest = np.flatnonzero(values <= values.min() + 1e-6)
+    return int(lowest[len(lowest) // 2])
+
+
+def choose_anchor(
+    segment_ends_s: list[float],
+    chunk_start_s: float,
+    cut_s: float,
+    smoothed: np.ndarray,
+    frame_s: float,
+    *,
+    guard_s: float = 0.3,
+    min_advance_s: float = 5.0,
+    snap_s: float = 0.3,
+) -> tuple[int, float] | None:
+    """
+    After a forced cut, find where the next chunk should start so the cut-off speech is decoded whole.
+
+    Mirrors Whisper's own seek: restart right after the last subtitle segment that ended well before
+    the cut (at least guard_s), snapped to the least speech-like frame within snap_s of its end.
+    The anchor must be at least min_advance_s into the chunk so processing always moves forward.
+
+    Returns (anchor_frame, keep_until_s): keep the chunk's segments ending at or before keep_until_s
+    and start the next chunk at anchor_frame; or None if no segment qualifies.
+    """
+    earliest = chunk_start_s + min_advance_s
+    latest = cut_s - guard_s
+    candidates = [end for end in segment_ends_s if earliest <= end <= latest]
+    if not candidates:
+        return None
+
+    keep_until_s = max(candidates)
+    lo = max(int(np.ceil(earliest / frame_s)), int(round((keep_until_s - snap_s) / frame_s)))
+    hi = min(int(latest / frame_s), int(round((keep_until_s + snap_s) / frame_s)), len(smoothed) - 1)
+    if hi < lo:
+        return int(round(keep_until_s / frame_s)), keep_until_s
+    return lo + _middle_of_lowest(smoothed[lo : hi + 1]), keep_until_s

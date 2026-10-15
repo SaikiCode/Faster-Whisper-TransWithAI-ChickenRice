@@ -46,7 +46,7 @@ except Exception as e:
 # Import modern i18n module for translations
 from . import i18n_modern as i18n
 from . import inject_vad, precomputed_speech_probs, uninject_vad
-from .smart_split import CHUNK_FINAL, AudioChunk, find_chunk_end, smooth_probs
+from .smart_split import CHUNK_FINAL, CHUNK_FORCED, AudioChunk, choose_anchor, find_chunk_end, smooth_probs
 from .vad_manager import VadConfig, VadModelManager, resolve_neg_threshold
 
 # Convenience imports
@@ -958,14 +958,32 @@ class Inference:
             if chunk_duration is not None:
                 inner_duration_after_vad += chunk_duration
                 has_inner_duration = True
+
+            next_start_frame = end_frame
+            if kind == CHUNK_FORCED:
+                # The cut may have split a word: keep only the segments that ended well before it and
+                # decode the rest again as part of the next chunk.
+                anchor = choose_anchor(
+                    [segment.end / 1_000 for segment in chunk_segments],
+                    chunk.start,
+                    chunk.end,
+                    smoothed,
+                    frame_samples / WHISPER_SAMPLING_RATE,
+                )
+                if anchor is not None:
+                    next_start_frame, keep_until_s = anchor
+                    keep_until_ms = int(round(keep_until_s * 1_000))
+                    chunk_segments = [segment for segment in chunk_segments if segment.end <= keep_until_ms]
+                    stats["reanchored"] += 1
             segments.extend(chunk_segments)
-            start_frame = end_frame
+            start_frame = next_start_frame
 
         logger.info(
-            "Smart VAD split: chunks=%s pause=%s forced=%s final=%s skipped=%s",
+            "Smart VAD split: chunks=%s pause=%s forced=%s reanchored=%s final=%s skipped=%s",
             chunk_index,
             stats["pause"],
             stats["forced"],
+            stats["reanchored"],
             stats["final"],
             stats["skipped"],
         )
