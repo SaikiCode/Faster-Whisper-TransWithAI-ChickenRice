@@ -8,6 +8,7 @@ from .injection import (
     auto_inject_vad,
     inject_vad,
     is_injection_active,
+    precomputed_speech_probs,
     uninject_vad,
     with_vad_injection,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "auto_inject_vad",
     "VadOptionsCompat",
     "is_injection_active",
+    "precomputed_speech_probs",
     "VadModelManager",
     "WhisperVadModel",
 ]

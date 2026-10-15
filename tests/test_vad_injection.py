@@ -43,5 +43,35 @@ class SharedManagerTests(unittest.TestCase):
         self.assertIsNone(injection._global_manager)
 
 
+class PrecomputedProbsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = mock.Mock(frame_duration_ms=20)
+        self.manager.get_speech_timestamps.return_value = []
+        injection._global_manager = self.manager
+
+    def tearDown(self) -> None:
+        injection._global_manager = None
+
+    def passed_probs(self):
+        return self.manager.get_speech_timestamps.call_args.kwargs.get("speech_probs")
+
+    def test_matching_probs_are_forwarded(self) -> None:
+        probs = np.full(50, 0.9)
+        with injection.precomputed_speech_probs(probs):
+            injection.get_speech_timestamps_injected(np.zeros(16_000, dtype=np.float32))  # 1s = 50 frames
+        self.assertIs(self.passed_probs(), probs)
+
+    def test_mismatched_probs_fall_back_to_running_the_model(self) -> None:
+        with injection.precomputed_speech_probs(np.full(80, 0.9)):
+            injection.get_speech_timestamps_injected(np.zeros(16_000, dtype=np.float32))
+        self.assertIsNone(self.passed_probs())
+
+    def test_context_is_cleared_on_exit(self) -> None:
+        with injection.precomputed_speech_probs(np.full(50, 0.9)):
+            pass
+        injection.get_speech_timestamps_injected(np.zeros(16_000, dtype=np.float32))
+        self.assertIsNone(self.passed_probs())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,15 @@ class VadConfig:
 class VadModel(Protocol):
     """Protocol for VAD models"""
 
+    @property
+    def frame_duration_ms(self) -> int:
+        """Duration of one probability frame"""
+        ...
+
+    def get_speech_probs(self, audio: np.ndarray, sampling_rate: int = 16000) -> np.ndarray:
+        """Get frame-level speech probabilities from audio"""
+        ...
+
     def get_speech_timestamps(self, audio: np.ndarray, sampling_rate: int = 16000, **kwargs) -> list[dict[str, Any]]:
         """Get speech timestamps from audio"""
         ...
@@ -342,8 +351,48 @@ def get_speech_timestamps_onnx(
     model.reset_states()
     speech_probs = model.audio_forward(audio, sampling_rate)
 
+    return speech_probs_to_timestamps(
+        speech_probs,
+        frame_duration_ms=model.frame_duration_ms,
+        threshold=threshold,
+        sampling_rate=sampling_rate,
+        min_speech_duration_ms=min_speech_duration_ms,
+        max_speech_duration_s=max_speech_duration_s,
+        min_silence_duration_ms=min_silence_duration_ms,
+        speech_pad_ms=speech_pad_ms,
+        return_seconds=return_seconds,
+        neg_threshold=neg_threshold,
+        progress_tracking_callback=progress_tracking_callback,
+    )
+
+
+def resolve_neg_threshold(threshold: float, neg_threshold: float | None) -> float:
+    """Negative (speech offset) threshold for hysteresis; defaults to threshold - 0.15."""
+    if neg_threshold is None:
+        return max(threshold - 0.15, 0.01)
+    return neg_threshold
+
+
+def speech_probs_to_timestamps(
+    speech_probs: np.ndarray,
+    *,
+    frame_duration_ms: int = 20,
+    threshold: float = 0.5,
+    sampling_rate: int = 16000,
+    min_speech_duration_ms: int = 250,
+    max_speech_duration_s: float = float("inf"),
+    min_silence_duration_ms: int = 100,
+    speech_pad_ms: int = 30,
+    return_seconds: bool = True,
+    neg_threshold: float | None = None,
+    progress_tracking_callback: Callable[[float], None] | None = None,
+) -> list[dict[str, float]]:
+    """Turn frame-level speech probabilities into speech segments (Silero-style post-processing).
+
+    Split from get_speech_timestamps_onnx so probabilities computed once for a whole file can be
+    reused for any sub-range of it without running the ONNX model again.
+    """
     # Calculate frame parameters
-    frame_duration_ms = model.frame_duration_ms
     frame_samples = int(sampling_rate * frame_duration_ms / 1000)
 
     # Convert durations to frames
@@ -357,8 +406,7 @@ def get_speech_timestamps_onnx(
     )
 
     # Set negative threshold for hysteresis
-    if neg_threshold is None:
-        neg_threshold = max(threshold - 0.15, 0.01)
+    neg_threshold = resolve_neg_threshold(threshold, neg_threshold)
 
     # Track speech segments
     triggered = False
@@ -496,6 +544,28 @@ class WhisperVadModel:
         else:
             logger.warning(_("vad.path_invalid", path=self.config.onnx_model_path))
 
+    @property
+    def frame_duration_ms(self) -> int:
+        if self.wrapper is not None:
+            return int(self.wrapper.frame_duration_ms)
+        return int(self.config.frame_duration_ms)
+
+    def get_speech_probs(self, audio: np.ndarray, sampling_rate: int = 16000) -> np.ndarray:
+        """Frame-level speech probabilities, trimmed to the frames that actually cover the audio."""
+        if self.wrapper is None:
+            logger.error(_("vad.not_initialized"))
+            return np.zeros(0, dtype=np.float32)
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0 if audio.shape[0] > audio.shape[1] else 1)
+
+        self.wrapper.reset_states()
+        speech_probs = self.wrapper.audio_forward(audio, sampling_rate)
+        # audio_forward pads the last 30s window with zeros; drop the frames past the end of the audio.
+        resampled_samples = len(audio) * self.wrapper.sample_rate / sampling_rate
+        frame_samples = self.wrapper.sample_rate * self.frame_duration_ms / 1000
+        return speech_probs[: int(np.ceil(resampled_samples / frame_samples))]
+
     def get_speech_timestamps(
         self,
         audio: np.ndarray,
@@ -506,14 +576,19 @@ class WhisperVadModel:
         min_silence_duration_ms: int | None = None,
         speech_pad_ms: int | None = None,
         neg_threshold: float | None = None,
+        speech_probs: np.ndarray | None = None,
         **kwargs,
     ) -> list[dict[str, Any]]:
         """
         Get speech timestamps using Whisper VAD.
+
+        If speech_probs is given (precomputed with get_speech_probs), the ONNX model is not run.
         """
-        if self.wrapper is None:
-            logger.error(_("vad.not_initialized"))
-            return []
+        if speech_probs is None:
+            if self.wrapper is None:
+                logger.error(_("vad.not_initialized"))
+                return []
+            speech_probs = self.get_speech_probs(audio, sampling_rate)
 
         # Use provided parameters or defaults from config
         threshold = threshold if threshold is not None else self.config.threshold
@@ -529,11 +604,10 @@ class WhisperVadModel:
         )
         speech_pad_ms = speech_pad_ms if speech_pad_ms is not None else self.config.speech_pad_ms
 
-        # Use ONNX model for speech detection
         # Return sample indices (not seconds) for compatibility with faster_whisper
-        segments = get_speech_timestamps_onnx(
-            audio=audio,
-            model=self.wrapper,
+        segments = speech_probs_to_timestamps(
+            speech_probs,
+            frame_duration_ms=self.frame_duration_ms,
             threshold=threshold,
             sampling_rate=sampling_rate,
             min_speech_duration_ms=min_speech_duration_ms,
@@ -606,6 +680,15 @@ class VadModelManager:
         """
         model = self.get_model(model_id)
         return model.get_speech_timestamps(audio, sampling_rate, **kwargs)
+
+    def get_speech_probs(self, model_id: str, audio: np.ndarray, sampling_rate: int = 16000) -> np.ndarray:
+        """Get frame-level speech probabilities (reusable via get_speech_timestamps(speech_probs=...))."""
+        return self.get_model(model_id).get_speech_probs(audio, sampling_rate)
+
+    @property
+    def frame_duration_ms(self) -> int:
+        """Duration of one speech probability frame of the default model."""
+        return self.get_model(self.config.default_model).frame_duration_ms
 
     @classmethod
     def get_available_models(cls) -> list[str]:

@@ -5,7 +5,8 @@ Provides transparent switching between custom VAD models
 
 import logging
 import unittest.mock as mock
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,25 @@ _active_patches = []
 _global_config = None
 _global_progress_callback = None
 _global_manager: VadModelManager | None = None
+_precomputed_speech_probs: np.ndarray | None = None
+
+
+@contextmanager
+def precomputed_speech_probs(speech_probs: np.ndarray) -> Iterator[None]:
+    """
+    Let injected VAD calls reuse already computed frame probabilities instead of running the model.
+
+    Used around faster_whisper transcribe() calls on a slice of audio whose probabilities were
+    computed as part of the whole file. The probabilities are only used when their frame count
+    matches the audio passed by faster_whisper.
+    """
+    global _precomputed_speech_probs
+    previous = _precomputed_speech_probs
+    _precomputed_speech_probs = speech_probs
+    try:
+        yield
+    finally:
+        _precomputed_speech_probs = previous
 
 
 @dataclass
@@ -114,6 +134,18 @@ def get_speech_timestamps_injected(
 
     # Merge options_dict with remaining kwargs
     final_kwargs = {**options_dict, **kwargs_copy}
+
+    if _precomputed_speech_probs is not None:
+        frame_samples = sampling_rate * manager.frame_duration_ms / 1000
+        expected_frames = int(np.ceil(len(audio) / frame_samples))
+        if abs(len(_precomputed_speech_probs) - expected_frames) <= 1:
+            final_kwargs["speech_probs"] = _precomputed_speech_probs
+        else:
+            logger.debug(
+                "Ignoring precomputed VAD probabilities: %s frames for audio of %s frames",
+                len(_precomputed_speech_probs),
+                expected_frames,
+            )
 
     # Get speech timestamps using the model manager
     return manager.get_speech_timestamps(model_id=model_id, audio=audio, sampling_rate=sampling_rate, **final_kwargs)

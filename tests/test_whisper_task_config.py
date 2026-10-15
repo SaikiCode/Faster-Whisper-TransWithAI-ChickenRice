@@ -7,10 +7,13 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 sys.modules.setdefault("pyjson5", types.SimpleNamespace(decode_io=json.load))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import faster_whisper_transwithai_chickenrice.infer as infer_module
+import faster_whisper_transwithai_chickenrice.injection as injection_module
 from faster_whisper_transwithai_chickenrice.infer import (
     AudioChunk,
     Inference,
@@ -174,7 +177,8 @@ class SmartSplitTests(unittest.TestCase):
             "vad_parameters": {"threshold": 0.5},
         }
         inference.smart_split_options = infer_module.SmartSplitOptions(enabled=True, target_chunk_duration_s=2.0)
-        inference.vad_manager = mock.Mock()
+        inference.vad_manager = mock.Mock(frame_duration_ms=20)
+        inference.vad_manager.get_speech_probs.return_value = np.arange(250, dtype=np.float32)
         inference.vad_manager.get_speech_timestamps.return_value = [
             {"start": 0, "end": 16_000},
             {"start": 48_000, "end": 64_000},
@@ -183,9 +187,11 @@ class SmartSplitTests(unittest.TestCase):
         class FakeModel:
             def __init__(self) -> None:
                 self.calls = []
+                self.probs_seen = []
 
             def transcribe(self, audio, **config):
                 self.calls.append((len(audio), dict(config)))
+                self.probs_seen.append(injection_module._precomputed_speech_probs)
                 index = len(self.calls)
                 segment = mock.Mock(start=0.0, end=0.5, text=f"chunk {index}")
                 return [segment], mock.Mock(duration=len(audio) / 16_000, duration_after_vad=0.5)
@@ -204,6 +210,15 @@ class SmartSplitTests(unittest.TestCase):
         self.assertEqual(segments[2], Segment(start=4_000, end=4_500, text="chunk 3"))
         self.assertEqual(info.duration, 5.0)
         self.assertEqual(info.duration_after_vad, 1.5)
+
+        # VAD ran once for the whole file; each chunk got its own 2s (100 frame) slice of the probabilities.
+        inference.vad_manager.get_speech_probs.assert_called_once()
+        self.assertIs(
+            inference.vad_manager.get_speech_timestamps.call_args.kwargs["speech_probs"],
+            inference.vad_manager.get_speech_probs.return_value,
+        )
+        self.assertEqual([list(p[[0, -1]]) for p in model.probs_seen], [[0, 99], [100, 199], [200, 249]])
+        self.assertIsNone(injection_module._precomputed_speech_probs)
 
 
 if __name__ == "__main__":

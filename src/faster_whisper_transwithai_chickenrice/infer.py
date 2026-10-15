@@ -5,6 +5,7 @@ Inference script with custom VAD injection support
 
 import argparse
 import code
+import contextlib
 import json
 import logging
 import os
@@ -43,7 +44,7 @@ except Exception as e:
 # Import our VAD injection system
 # Import modern i18n module for translations
 from . import i18n_modern as i18n
-from . import inject_vad, uninject_vad
+from . import inject_vad, precomputed_speech_probs, uninject_vad
 from .vad_manager import VadConfig, VadModelManager
 
 # Convenience imports
@@ -890,21 +891,24 @@ class Inference:
 
         return audio, config, duration_after_vad
 
-    def _plan_smart_chunks(self, audio_path: str) -> tuple[Any, list[AudioChunk], float | None]:
+    def _plan_smart_chunks(self, audio_path: str) -> tuple[Any, list[AudioChunk], float | None, Any]:
         audio = decode_audio(audio_path, sampling_rate=WHISPER_SAMPLING_RATE)
         duration = len(audio) / WHISPER_SAMPLING_RATE
 
         if not self.smart_split_options.enabled or not self.generation_config.get("vad_filter"):
-            return audio, [AudioChunk(0, 0.0, duration)], None
+            return audio, [AudioChunk(0, 0.0, duration)], None, None
 
         if self.vad_manager is None:
-            return audio, [AudioChunk(0, 0.0, duration)], None
+            return audio, [AudioChunk(0, 0.0, duration)], None, None
 
+        # Run the VAD model once; the per-chunk VAD inside faster_whisper reuses these probabilities.
+        speech_probs = self.vad_manager.get_speech_probs("whisper_vad", audio, WHISPER_SAMPLING_RATE)
         vad_parameters = self.generation_config.get("vad_parameters") or {}
         vad_segments = self.vad_manager.get_speech_timestamps(
             model_id="whisper_vad",
             audio=audio,
             sampling_rate=WHISPER_SAMPLING_RATE,
+            speech_probs=speech_probs,
             **vad_parameters,
         )
         duration_after_vad = sum(segment["end"] - segment["start"] for segment in vad_segments) / WHISPER_SAMPLING_RATE
@@ -920,13 +924,13 @@ class Inference:
             chunks = [AudioChunk(0, 0.0, duration)]
         logger.info("Smart VAD split planned %s chunk(s)", len(chunks))
 
-        return audio, chunks, duration_after_vad
+        return audio, chunks, duration_after_vad, speech_probs
 
     def _transcribe_standard(self, model, audio_input, transcription_config):
         return model.transcribe(audio_input, **transcription_config)
 
     def _transcribe_smart_chunks(self, model, task: InferenceTask) -> tuple[list[Segment], Any]:
-        audio, chunks, outer_duration_after_vad = self._plan_smart_chunks(task.audio_path)
+        audio, chunks, outer_duration_after_vad, speech_probs = self._plan_smart_chunks(task.audio_path)
         duration = len(audio) / WHISPER_SAMPLING_RATE
         config = dict(self.generation_config)
         config.pop("clip_timestamps", None)
@@ -954,13 +958,21 @@ class Inference:
                 SubWriter.srt_timestamp(int(round(chunk.start * 1_000))),
                 SubWriter.srt_timestamp(int(round(chunk.end * 1_000))),
             )
-            chunk_segments_iter, chunk_info = model.transcribe(chunk_audio, **config)
+            with contextlib.ExitStack() as stack:
+                if speech_probs is not None and self.vad_manager is not None:
+                    frame_samples = WHISPER_SAMPLING_RATE * self.vad_manager.frame_duration_ms // 1000
+                    first_frame = start_sample // frame_samples
+                    last_frame = -(-end_sample // frame_samples)
+                    stack.enter_context(precomputed_speech_probs(speech_probs[first_frame:last_frame]))
+                chunk_segments_iter, chunk_info = model.transcribe(chunk_audio, **config)
+                # Decoding is lazy; consume it inside the context so any deferred VAD call still sees the probs.
+                chunk_segments = list(chunk_segments_iter)
             if hasattr(chunk_info, "duration_after_vad"):
                 inner_duration_after_vad += float(chunk_info.duration_after_vad)
                 has_inner_duration = True
             chunk_offset_ms = int(round(chunk.start * 1_000))
             chunk_end_ms = int(round(chunk.end * 1_000))
-            for _segment in chunk_segments_iter:
+            for _segment in chunk_segments:
                 segment = Segment(
                     start=chunk_offset_ms + int(round(_segment.start * 1_000)),
                     end=chunk_offset_ms + int(round(_segment.end * 1_000)),
