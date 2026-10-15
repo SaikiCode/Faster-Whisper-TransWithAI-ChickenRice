@@ -237,6 +237,10 @@ class WhisperVADOnnxWrapper:
 
         # Run inference
         outputs = self.session.run(self.output_names, {self.input_name: inputs.input_features})
+        if self.device != "CPU" and "CUDAExecutionProvider" not in self.session.get_providers():
+            # ONNX Runtime fell back to CPU inside run() (e.g. a cuDNN library failed to load).
+            self.device = "CPU"
+            logger.warning(_("vad.fell_back_to_cpu"))
 
         # Apply sigmoid to get probabilities
         frame_logits = outputs[0][0]  # Remove batch dimension

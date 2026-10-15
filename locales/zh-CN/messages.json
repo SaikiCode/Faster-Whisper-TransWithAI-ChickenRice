@@ -111,6 +111,7 @@
     "model_loaded": "ONNX模型已加载：{path}",
     "auto_configured": "自动配置ONNX使用{threads}个CPU线程（可用{total}个的一半）",
     "device": "设备：{device}",
+    "fell_back_to_cpu": "VAD 在 GPU 上运行失败（通常是 cuDNN 库版本不匹配），已改用 CPU 继续运行，速度会变慢",
     "providers": "提供器：{providers}",
     "chunk_duration": "块时长：{duration}毫秒",
     "frame_duration": "帧时长：{duration}毫秒",

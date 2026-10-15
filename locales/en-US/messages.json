@@ -111,6 +111,7 @@
     "model_loaded": "ONNX Model loaded: {path}",
     "auto_configured": "Auto-configured ONNX to use {threads} CPU threads (half of {total} available)",
     "device": "Device: {device}",
+    "fell_back_to_cpu": "VAD failed on the GPU (usually a mismatched cuDNN library) and continues on the CPU, which is slower",
     "providers": "Providers: {providers}",
     "chunk_duration": "Chunk duration: {duration}ms",
     "frame_duration": "Frame duration: {duration}ms",

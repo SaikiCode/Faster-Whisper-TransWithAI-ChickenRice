@@ -1,6 +1,8 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -9,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from faster_whisper_transwithai_chickenrice.vad_manager import (
     VadConfig,
     WhisperVadModel,
+    WhisperVADOnnxWrapper,
     get_speech_timestamps_onnx,
     speech_probs_to_timestamps,
 )
@@ -148,6 +151,29 @@ class WhisperVadModelProbsTests(unittest.TestCase):
             **GOLDEN_CASES["project_defaults"][0],
         )
         self.assertEqual(len(segments), 6)
+
+
+class OnnxFallbackTests(unittest.TestCase):
+    def test_device_follows_onnx_runtime_falling_back_to_cpu(self) -> None:
+        wrapper = WhisperVADOnnxWrapper.__new__(WhisperVADOnnxWrapper)
+        wrapper.sample_rate = 16_000
+        wrapper.chunk_samples = 16_000
+        wrapper.input_name = "input_features"
+        wrapper.output_names = ["logits"]
+        wrapper.device = "GPU (CUDA)"
+        wrapper.feature_extractor = mock.Mock(return_value=SimpleNamespace(input_features=np.zeros((1, 80, 3000))))
+        wrapper.session = mock.Mock()
+        wrapper.session.run.return_value = [np.zeros((1, 1500))]
+        wrapper.session.get_providers.return_value = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        wrapper(np.zeros(16_000, dtype=np.float32))
+        self.assertEqual(wrapper.device, "GPU (CUDA)")
+
+        # ONNX Runtime switched the session to CPU inside run() after a cuDNN failure.
+        wrapper.session.get_providers.return_value = ["CPUExecutionProvider"]
+        with self.assertLogs("faster_whisper_transwithai_chickenrice.vad_manager", "WARNING"):
+            wrapper(np.zeros(16_000, dtype=np.float32))
+        self.assertEqual(wrapper.device, "CPU")
 
 
 if __name__ == "__main__":
