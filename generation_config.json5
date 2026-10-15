@@ -35,6 +35,12 @@
 
     "repetition_penalty": 1.1,
 
+    // 禁止连续 20 个 token 的片段在一段输出里重复出现，防止解码陷入重复循环（循环会触发耗时的重新解码和高温采样）
+    // 短句仍可正常重复（如“欢迎回来 欢迎回来”），但约 10 个 token 的短句最多只能重复到第三遍；设为 0 关闭
+    // Forbid any 20-token sequence from repeating within one output, so decoding cannot get stuck in a repetition loop
+    // (a loop triggers slow re-decoding and high-temperature sampling). Short phrases can still repeat; set 0 to disable
+    "no_repeat_ngram_size": 20,
+
     // 解码失败时的温度回退序列。高温采样是幻听（凭空编造台词）的主要来源，所以上限只到 0.4
     // Temperature fallback when decoding fails. High-temperature sampling is the main source of hallucinations, so cap it at 0.4
     "temperature": [0.0, 0.2, 0.4],
