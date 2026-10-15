@@ -25,6 +25,7 @@ _injection_active = False
 _active_patches = []
 _global_config = None
 _global_progress_callback = None
+_global_manager: VadModelManager | None = None
 
 
 @dataclass
@@ -57,6 +58,14 @@ def get_global_config() -> VadConfig:
     return _global_config
 
 
+def _get_manager(config: VadConfig, progress_callback: Callable | None) -> VadModelManager:
+    """Return the shared VAD manager, creating it once so the ONNX model is only loaded once."""
+    global _global_manager
+    if _global_manager is None:
+        _global_manager = VadModelManager(config=config, ttl=config.ttl, progress_callback=progress_callback)
+    return _global_manager
+
+
 def get_speech_timestamps_injected(
     audio: np.ndarray, vad_options: Any = None, sampling_rate: int = 16000, **kwargs
 ) -> list[dict[str, Any]]:
@@ -75,8 +84,7 @@ def get_speech_timestamps_injected(
     # Check if a progress callback was provided (from kwargs or global)
     progress_callback = kwargs.get("progress_callback") or _global_progress_callback
 
-    # Create manager (this uses cached instances internally)
-    manager = VadModelManager(config=config, ttl=config.ttl, progress_callback=progress_callback)
+    manager = _get_manager(config, progress_callback)
 
     # Extract options from vad_options (works with both real and mock VadOptions)
     if vad_options is not None:
@@ -148,7 +156,10 @@ def get_vad_patches(model_id: str | None = None) -> dict[str, mock.Mock]:
 
 
 def inject_vad(
-    model_id: str | None = None, config: VadConfig | None = None, progress_callback: Callable | None = None
+    model_id: str | None = None,
+    config: VadConfig | None = None,
+    progress_callback: Callable | None = None,
+    manager: VadModelManager | None = None,
 ) -> None:
     """
     Inject VAD implementation to redirect faster_whisper calls.
@@ -158,8 +169,9 @@ def inject_vad(
                  If None, uses the configured default model.
         config: Optional VadConfig to use for injection
         progress_callback: Optional progress callback for VAD processing
+        manager: Optional existing VadModelManager to reuse instead of loading another model
     """
-    global _injection_active, _active_patches, _global_progress_callback
+    global _injection_active, _active_patches, _global_progress_callback, _global_manager
 
     if _injection_active:
         logger.warning(_("injection.already_active"))
@@ -167,6 +179,7 @@ def inject_vad(
 
     # Store progress callback globally
     _global_progress_callback = progress_callback
+    _global_manager = manager
 
     # Set config if provided
     if config:
@@ -194,7 +207,7 @@ def uninject_vad() -> None:
     """
     Remove VAD injection and restore original faster_whisper behavior.
     """
-    global _injection_active, _active_patches, _global_progress_callback
+    global _injection_active, _active_patches, _global_progress_callback, _global_manager
 
     if not _injection_active:
         logger.warning(_("injection.not_active"))
@@ -209,6 +222,7 @@ def uninject_vad() -> None:
     _active_patches.clear()
     _injection_active = False
     _global_progress_callback = None  # Clear the progress callback
+    _global_manager = None
     logger.info(_("info.vad_deactivated"))
 
 

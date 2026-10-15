@@ -829,6 +829,7 @@ class Inference:
             model_id=vad_model,
             config=vad_config,
             progress_callback=self._vad_progress_callback,
+            manager=self.vad_manager,
         )
         self.vad_injected = True
         logger.info(_("info.vad_activated", threshold=vad_config.threshold))
