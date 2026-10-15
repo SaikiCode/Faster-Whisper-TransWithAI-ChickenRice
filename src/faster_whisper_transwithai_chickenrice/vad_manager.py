@@ -412,8 +412,14 @@ def speech_probs_to_timestamps(
     triggered = False
     speeches: list[dict[str, float]] = []
     current_speech: dict[str, float] = {}
-    current_probs = []  # Track probabilities for current segment
     temp_end = 0
+
+    def close_segment(end: int) -> None:
+        start = int(current_speech["start"])
+        current_speech["end"] = end
+        if end > start:
+            current_speech["probability"] = float(np.mean(speech_probs[start:end]))
+        speeches.append(current_speech)
 
     # Process each frame
     for i, speech_prob in enumerate(speech_probs):
@@ -422,32 +428,23 @@ def speech_probs_to_timestamps(
             progress = (i + 1) / len(speech_probs) * 100
             progress_tracking_callback(progress)
 
-        # Track probabilities for current segment
-        if triggered:
-            current_probs.append(float(speech_prob))
-
         # Speech onset detection
         if speech_prob >= threshold and not triggered:
             triggered = True
             current_speech["start"] = i
-            current_probs = [float(speech_prob)]  # Start tracking probabilities
             continue
 
         # Check for maximum speech duration
-        if triggered and "start" in current_speech:
-            duration = i - current_speech["start"]
-            if duration > max_speech_frames:
-                # Force end segment at max duration
-                current_speech["end"] = current_speech["start"] + max_speech_frames
-                # Calculate probability statistics for segment
-                if current_probs:
-                    current_speech["probability"] = np.mean(current_probs)
-                speeches.append(current_speech)
-                current_speech = {}
-                current_probs = []
-                triggered = False
+        if triggered and i - current_speech["start"] > max_speech_frames:
+            # Split at the least speech-like frame in the second half of the allowed span instead of
+            # cutting at the exact limit, and keep the speech going from there (no frames dropped).
+            start = int(current_speech["start"])
+            window_start = start + max(1, max_speech_frames // 2)
+            split = window_start + int(np.argmin(speech_probs[window_start : start + max_speech_frames + 1]))
+            close_segment(split)
+            current_speech = {"start": split}
+            if temp_end and temp_end <= split:
                 temp_end = 0
-                continue
 
         # Speech offset detection with hysteresis
         if speech_prob < neg_threshold and triggered:
@@ -456,20 +453,11 @@ def speech_probs_to_timestamps(
 
             # Check if silence is long enough
             if i - temp_end >= min_silence_frames:
-                # End current speech segment
-                current_speech["end"] = temp_end
-
-                # Check minimum duration
-                if current_speech["end"] - current_speech["start"] >= min_speech_frames:
-                    # Calculate probability statistics for segment
-                    if current_probs:
-                        current_speech["probability"] = np.mean(
-                            current_probs[: temp_end - int(current_speech["start"])]
-                        )
-                    speeches.append(current_speech)
+                # End current speech segment if it is long enough
+                if temp_end - current_speech["start"] >= min_speech_frames:
+                    close_segment(temp_end)
 
                 current_speech = {}
-                current_probs = []
                 triggered = False
                 temp_end = 0
 
@@ -478,13 +466,8 @@ def speech_probs_to_timestamps(
             temp_end = 0
 
     # Handle speech that continues to the end
-    if triggered and "start" in current_speech:
-        current_speech["end"] = len(speech_probs)
-        if current_speech["end"] - current_speech["start"] >= min_speech_frames:
-            # Calculate probability statistics for segment
-            if current_probs:
-                current_speech["probability"] = np.mean(current_probs)
-            speeches.append(current_speech)
+    if triggered and len(speech_probs) - current_speech["start"] >= min_speech_frames:
+        close_segment(len(speech_probs))
 
     # Apply padding to segments
     for i, speech in enumerate(speeches):

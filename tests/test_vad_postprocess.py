@@ -89,6 +89,22 @@ class SpeechProbsToTimestampsTests(unittest.TestCase):
                 )
                 self.assertEqual(as_tuples(segments), expected)
 
+    def test_max_speech_duration_splits_at_least_speech_like_frame_without_dropping_frames(self) -> None:
+        probs = np.full(1000, 0.9)
+        probs[400] = 0.6  # still speech, but the best place to split
+        probs[800] = 0.7
+        segments = speech_probs_to_timestamps(
+            probs,
+            frame_duration_ms=20,
+            sampling_rate=16_000,
+            return_seconds=False,
+            max_speech_duration_s=10.0,  # 500 frames
+            min_speech_duration_ms=0,
+            speech_pad_ms=0,
+        )
+        frames = [(int(s["start"]) // 320, int(s["end"]) // 320) for s in segments]
+        self.assertEqual(frames, [(0, 400), (400, 800), (800, 1000)])
+
     def test_onnx_wrapper_path_matches_probs_path(self) -> None:
         probs = make_probs()
         kwargs = GOLDEN_CASES["project_defaults"][0]
