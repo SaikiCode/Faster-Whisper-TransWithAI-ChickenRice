@@ -15,11 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import faster_whisper_transwithai_chickenrice.infer as infer_module
 import faster_whisper_transwithai_chickenrice.injection as injection_module
 from faster_whisper_transwithai_chickenrice.infer import (
-    AudioChunk,
     Inference,
     Segment,
-    SpeechSpan,
-    create_contiguous_chunks,
     enforce_segment_timeline,
     vad_segments_to_clip_timestamps,
 )
@@ -143,20 +140,6 @@ class VadClipTimestampTests(unittest.TestCase):
 
 
 class SmartSplitTests(unittest.TestCase):
-    def test_create_contiguous_chunks_prefers_silence_near_target_end(self) -> None:
-        chunks = create_contiguous_chunks(
-            [
-                SpeechSpan(0.0, 8.0),
-                SpeechSpan(12.0, 20.0),
-                SpeechSpan(26.0, 35.0),
-            ],
-            max_duration=30.0,
-            total_duration=40.0,
-        )
-
-        self.assertEqual(chunks[0], AudioChunk(0, 0.0, 23.0))
-        self.assertEqual(chunks[1], AudioChunk(1, 23.0, 40.0))
-
     def test_enforce_segment_timeline_caps_and_removes_overlaps(self) -> None:
         segments = [
             Segment(start=1_000, end=30_000, text="first"),
@@ -177,8 +160,12 @@ class SmartSplitTests(unittest.TestCase):
             "vad_parameters": {"threshold": 0.5},
         }
         inference.smart_split_options = infer_module.SmartSplitOptions(enabled=True, target_chunk_duration_s=2.0)
+        # 5s of audio (250 frames): speech 0-1s, pause 1-3s, speech 3-4s, pause 4-5s.
+        probs = np.full(250, 0.05, dtype=np.float32)
+        probs[0:50] = 0.9
+        probs[150:200] = 0.9
         inference.vad_manager = mock.Mock(frame_duration_ms=20)
-        inference.vad_manager.get_speech_probs.return_value = np.arange(250, dtype=np.float32)
+        inference.vad_manager.get_speech_probs.return_value = probs
         inference.vad_manager.get_speech_timestamps.return_value = [
             {"start": 0, "end": 16_000},
             {"start": 48_000, "end": 64_000},
@@ -199,25 +186,23 @@ class SmartSplitTests(unittest.TestCase):
         model = FakeModel()
         task = mock.Mock(audio_path="audio.mp3")
 
-        with mock.patch.object(infer_module, "decode_audio", return_value=[0.0] * 80_000):
+        with mock.patch.object(infer_module, "decode_audio", return_value=np.zeros(80_000, dtype=np.float32)):
             segments, info = inference._transcribe_smart_chunks(model, task)
 
-        self.assertEqual(len(model.calls), 3)
+        # Chunks are cut in the middle of the in-zone pauses: [0, 1.6s) [1.6, 2.88s) [2.88, 4.48s) [4.48, 5s).
+        # The 2nd and 4th chunks contain no outer VAD speech and are skipped.
+        self.assertEqual([length for length, _config in model.calls], [25_600, 25_600])
         self.assertTrue(all(call_config["vad_filter"] for _length, call_config in model.calls))
         self.assertNotIn("clip_timestamps", model.calls[0][1])
-        self.assertEqual(segments[0], Segment(start=0, end=500, text="chunk 1"))
-        self.assertEqual(segments[1], Segment(start=2_000, end=2_500, text="chunk 2"))
-        self.assertEqual(segments[2], Segment(start=4_000, end=4_500, text="chunk 3"))
+        self.assertEqual(segments, [Segment(0, 500, "chunk 1"), Segment(2_880, 3_380, "chunk 2")])
         self.assertEqual(info.duration, 5.0)
-        self.assertEqual(info.duration_after_vad, 1.5)
+        self.assertEqual(info.duration_after_vad, 1.0)
 
-        # VAD ran once for the whole file; each chunk got its own 2s (100 frame) slice of the probabilities.
+        # VAD ran once for the whole file; each chunk got the matching slice of the probabilities.
         inference.vad_manager.get_speech_probs.assert_called_once()
-        self.assertIs(
-            inference.vad_manager.get_speech_timestamps.call_args.kwargs["speech_probs"],
-            inference.vad_manager.get_speech_probs.return_value,
-        )
-        self.assertEqual([list(p[[0, -1]]) for p in model.probs_seen], [[0, 99], [100, 199], [200, 249]])
+        self.assertIs(inference.vad_manager.get_speech_timestamps.call_args.kwargs["speech_probs"], probs)
+        self.assertTrue(np.array_equal(model.probs_seen[0], probs[0:80]))
+        self.assertTrue(np.array_equal(model.probs_seen[1], probs[144:224]))
         self.assertIsNone(injection_module._precomputed_speech_probs)
 
 

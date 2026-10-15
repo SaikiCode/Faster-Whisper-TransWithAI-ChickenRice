@@ -13,12 +13,13 @@ import platform
 import subprocess
 import sys
 import traceback
-from collections import ChainMap
+from collections import ChainMap, Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pyjson5
 
 # Import GPU/runtime-heavy deps defensively so `infer --help` still works on
@@ -45,7 +46,8 @@ except Exception as e:
 # Import modern i18n module for translations
 from . import i18n_modern as i18n
 from . import inject_vad, precomputed_speech_probs, uninject_vad
-from .vad_manager import VadConfig, VadModelManager
+from .smart_split import CHUNK_FINAL, AudioChunk, find_chunk_end, smooth_probs
+from .vad_manager import VadConfig, VadModelManager, resolve_neg_threshold
 
 # Convenience imports
 _ = i18n._
@@ -305,25 +307,12 @@ class Segment:
     text: str
 
 
-@dataclass(frozen=True)
-class SpeechSpan:
-    start: float
-    end: float
-
-    @property
-    def duration_s(self) -> float:
-        return max(0.0, self.end - self.start)
-
-
-@dataclass(frozen=True)
-class AudioChunk:
-    index: int
-    start: float
-    end: float
-
-    @property
-    def duration_s(self) -> float:
-        return max(0.0, self.end - self.start)
+@dataclass
+class SmartSplitInput:
+    audio: Any
+    speech_probs: np.ndarray | None  # whole-file VAD frame probabilities, None if VAD is unavailable
+    vad_segments: list[dict[str, Any]]  # outer VAD speech segments in samples
+    duration_after_vad: float | None
 
 
 @dataclass(frozen=True)
@@ -365,60 +354,8 @@ def vad_segments_to_clip_timestamps(
     return timestamps
 
 
-def vad_segments_to_speech_spans(
-    vad_segments: list[dict[str, Any]], sampling_rate: int = WHISPER_SAMPLING_RATE
-) -> list[SpeechSpan]:
-    spans: list[SpeechSpan] = []
-    for segment in vad_segments:
-        start = float(segment["start"]) / sampling_rate
-        end = float(segment["end"]) / sampling_rate
-        if end > start:
-            spans.append(SpeechSpan(start=start, end=end))
-    return spans
-
-
-def create_contiguous_chunks(
-    segments: list[SpeechSpan],
-    max_duration: float,
-    total_duration: float,
-    split_window_factor: float = 0.4,
-) -> list[AudioChunk]:
-    if max_duration <= 0:
-        raise ValueError("max_duration must be greater than 0")
-    if total_duration <= 0:
-        return []
-    if total_duration <= max_duration:
-        return [AudioChunk(0, 0.0, total_duration)]
-
-    chunks: list[AudioChunk] = []
-    current_start = 0.0
-    sorted_segments = sorted((span for span in segments if span.end > span.start), key=lambda span: span.start)
-
-    while current_start < total_duration:
-        potential_end = current_start + max_duration
-        if potential_end >= total_duration:
-            chunks.append(AudioChunk(len(chunks), current_start, total_duration))
-            break
-
-        decision_zone_start = current_start + (max_duration * (1 - split_window_factor))
-        best_split: float | None = None
-        best_gap_duration = 0.0
-
-        for previous, current in zip(sorted_segments, sorted_segments[1:], strict=False):
-            gap_start = previous.end
-            gap_end = current.start
-            if decision_zone_start <= gap_start and gap_end <= potential_end:
-                gap_duration = gap_end - gap_start
-                if gap_duration > 0.1 and gap_duration > best_gap_duration:
-                    best_gap_duration = gap_duration
-                    best_split = gap_start + (gap_duration / 2)
-
-        split_point = best_split if best_split is not None else potential_end
-        split_point = max(current_start, min(split_point, potential_end, total_duration))
-        chunks.append(AudioChunk(len(chunks), current_start, split_point))
-        current_start = split_point
-
-    return chunks
+def has_speech_between(vad_segments: list[dict[str, Any]], start_sample: int, end_sample: int) -> bool:
+    return any(segment["start"] < end_sample and segment["end"] > start_sample for segment in vad_segments)
 
 
 def _max_segment_end(start: int, end: int, max_duration_ms: int | None) -> int:
@@ -891,17 +828,12 @@ class Inference:
 
         return audio, config, duration_after_vad
 
-    def _plan_smart_chunks(self, audio_path: str) -> tuple[Any, list[AudioChunk], float | None, Any]:
+    def _prepare_smart_split(self, audio_path: str) -> SmartSplitInput:
         audio = decode_audio(audio_path, sampling_rate=WHISPER_SAMPLING_RATE)
-        duration = len(audio) / WHISPER_SAMPLING_RATE
-
-        if not self.smart_split_options.enabled or not self.generation_config.get("vad_filter"):
-            return audio, [AudioChunk(0, 0.0, duration)], None, None
-
         if self.vad_manager is None:
-            return audio, [AudioChunk(0, 0.0, duration)], None, None
+            return SmartSplitInput(audio, None, [], None)
 
-        # Run the VAD model once; the per-chunk VAD inside faster_whisper reuses these probabilities.
+        # Run the VAD model once; chunk planning and the per-chunk VAD inside faster_whisper reuse these.
         speech_probs = self.vad_manager.get_speech_probs("whisper_vad", audio, WHISPER_SAMPLING_RATE)
         vad_parameters = self.generation_config.get("vad_parameters") or {}
         vad_segments = self.vad_manager.get_speech_timestamps(
@@ -912,84 +844,136 @@ class Inference:
             **vad_parameters,
         )
         duration_after_vad = sum(segment["end"] - segment["start"] for segment in vad_segments) / WHISPER_SAMPLING_RATE
+        return SmartSplitInput(audio, speech_probs, vad_segments, duration_after_vad)
 
-        spans = vad_segments_to_speech_spans(vad_segments, WHISPER_SAMPLING_RATE)
-        chunks = create_contiguous_chunks(
-            spans,
-            min(self.smart_split_options.target_chunk_duration_s, MAX_SMART_CHUNK_DURATION_S),
-            duration,
-            self.smart_split_options.split_window_factor,
+    def _smart_split_frame_params(self) -> tuple[int, int, float]:
+        """(frame_samples, max_frames, pause_threshold) for planning chunks on VAD frames."""
+        assert self.vad_manager is not None
+        frame_ms = self.vad_manager.frame_duration_ms
+        frame_samples = WHISPER_SAMPLING_RATE * frame_ms // 1000
+        target_s = min(self.smart_split_options.target_chunk_duration_s, MAX_SMART_CHUNK_DURATION_S)
+        max_frames = max(1, int(target_s * 1000 // frame_ms))
+        vad_parameters = self.generation_config.get("vad_parameters") or {}
+        threshold = vad_parameters.get("threshold", VadConfig.threshold)
+        pause_threshold = resolve_neg_threshold(threshold, vad_parameters.get("neg_threshold"))
+        return frame_samples, max_frames, pause_threshold
+
+    def _transcribe_chunk(
+        self, model, audio, chunk: AudioChunk, chunk_probs: np.ndarray | None, config: dict[str, Any]
+    ) -> tuple[list[Segment], float | None]:
+        """Transcribe one contiguous chunk; returns segments in absolute ms (clipped to the chunk) and its VAD duration."""
+        start_sample = int(round(chunk.start * WHISPER_SAMPLING_RATE))
+        end_sample = int(round(chunk.end * WHISPER_SAMPLING_RATE))
+        logger.debug(
+            "Smart VAD chunk %s (%s): %s --> %s",
+            chunk.index + 1,
+            chunk.kind,
+            SubWriter.srt_timestamp(int(round(chunk.start * 1_000))),
+            SubWriter.srt_timestamp(int(round(chunk.end * 1_000))),
         )
-        if not chunks:
-            chunks = [AudioChunk(0, 0.0, duration)]
-        logger.info("Smart VAD split planned %s chunk(s)", len(chunks))
+        with contextlib.ExitStack() as stack:
+            if chunk_probs is not None:
+                stack.enter_context(precomputed_speech_probs(chunk_probs))
+            segments_iter, info = model.transcribe(audio[start_sample:end_sample], **config)
+            # Decoding is lazy; consume it inside the context so any deferred VAD call still sees the probs.
+            raw_segments = list(segments_iter)
 
-        return audio, chunks, duration_after_vad, speech_probs
+        chunk_offset_ms = int(round(chunk.start * 1_000))
+        chunk_end_ms = int(round(chunk.end * 1_000))
+        segments: list[Segment] = []
+        for _segment in raw_segments:
+            start = chunk_offset_ms + int(round(_segment.start * 1_000))
+            end = min(chunk_offset_ms + int(round(_segment.end * 1_000)), chunk_end_ms)
+            if start >= chunk_end_ms or end <= start:
+                continue
+            segment = Segment(start=start, end=end, text=_segment.text.strip())
+            segments.append(segment)
+            logger.debug(
+                f"[{SubWriter.lrc_timestamp(segment.start)} --> {SubWriter.lrc_timestamp(segment.end)}] {segment.text}"
+            )
+        duration_after_vad = float(info.duration_after_vad) if hasattr(info, "duration_after_vad") else None
+        return segments, duration_after_vad
 
-    def _transcribe_standard(self, model, audio_input, transcription_config):
-        return model.transcribe(audio_input, **transcription_config)
-
-    def _transcribe_smart_chunks(self, model, task: InferenceTask) -> tuple[list[Segment], Any]:
-        audio, chunks, outer_duration_after_vad, speech_probs = self._plan_smart_chunks(task.audio_path)
-        duration = len(audio) / WHISPER_SAMPLING_RATE
+    def _smart_chunk_config(self) -> dict[str, Any]:
         config = dict(self.generation_config)
         config.pop("clip_timestamps", None)
         config["vad_filter"] = bool(config.get("vad_filter", True))
         config.setdefault("beam_size", 1)
         config.setdefault("condition_on_previous_text", False)
+        return config
 
-        if outer_duration_after_vad == 0:
+    def _transcribe_smart_chunks(self, model, task: InferenceTask) -> tuple[list[Segment], Any]:
+        split_input = self._prepare_smart_split(task.audio_path)
+        audio = split_input.audio
+        duration = len(audio) / WHISPER_SAMPLING_RATE
+        config = self._smart_chunk_config()
+
+        if split_input.duration_after_vad == 0:
             return [], SimpleNamespace(duration=duration, duration_after_vad=0)
 
+        if split_input.speech_probs is None:
+            # No VAD model: transcribe the file as one piece and let faster_whisper handle it.
+            whole_segments, inner_duration = self._transcribe_chunk(
+                model, audio, AudioChunk(0, 0.0, duration), None, config
+            )
+            return whole_segments, SimpleNamespace(duration=duration, duration_after_vad=inner_duration or duration)
+
+        speech_probs = split_input.speech_probs
+        frame_samples, max_frames, pause_threshold = self._smart_split_frame_params()
+        smoothed = smooth_probs(speech_probs)
+        min_search_frames = int(round(1.0 * WHISPER_SAMPLING_RATE / frame_samples))
+
         segments: list[Segment] = []
+        stats: Counter[str] = Counter()
         inner_duration_after_vad = 0.0
         has_inner_duration = False
+        start_frame = 0
+        chunk_index = 0
 
-        for chunk in chunks:
-            start_sample = max(0, min(len(audio), int(round(chunk.start * WHISPER_SAMPLING_RATE))))
-            end_sample = max(start_sample, min(len(audio), int(round(chunk.end * WHISPER_SAMPLING_RATE))))
-            if end_sample <= start_sample:
-                continue
-            chunk_audio = audio[start_sample:end_sample]
-            logger.debug(
-                "Smart VAD chunk %s/%s: %s --> %s",
-                chunk.index + 1,
-                len(chunks),
-                SubWriter.srt_timestamp(int(round(chunk.start * 1_000))),
-                SubWriter.srt_timestamp(int(round(chunk.end * 1_000))),
+        while start_frame < len(speech_probs):
+            end_frame, kind = find_chunk_end(
+                smoothed,
+                start_frame,
+                max_frames=max_frames,
+                split_window_factor=self.smart_split_options.split_window_factor,
+                pause_threshold=pause_threshold,
+                min_search_frames=min_search_frames,
             )
-            with contextlib.ExitStack() as stack:
-                if speech_probs is not None and self.vad_manager is not None:
-                    frame_samples = WHISPER_SAMPLING_RATE * self.vad_manager.frame_duration_ms // 1000
-                    first_frame = start_sample // frame_samples
-                    last_frame = -(-end_sample // frame_samples)
-                    stack.enter_context(precomputed_speech_probs(speech_probs[first_frame:last_frame]))
-                chunk_segments_iter, chunk_info = model.transcribe(chunk_audio, **config)
-                # Decoding is lazy; consume it inside the context so any deferred VAD call still sees the probs.
-                chunk_segments = list(chunk_segments_iter)
-            if hasattr(chunk_info, "duration_after_vad"):
-                inner_duration_after_vad += float(chunk_info.duration_after_vad)
-                has_inner_duration = True
-            chunk_offset_ms = int(round(chunk.start * 1_000))
-            chunk_end_ms = int(round(chunk.end * 1_000))
-            for _segment in chunk_segments:
-                segment = Segment(
-                    start=chunk_offset_ms + int(round(_segment.start * 1_000)),
-                    end=chunk_offset_ms + int(round(_segment.end * 1_000)),
-                    text=_segment.text.strip(),
-                )
-                if segment.start >= chunk_end_ms:
-                    continue
-                segment = Segment(segment.start, min(segment.end, chunk_end_ms), segment.text)
-                if segment.end > segment.start:
-                    segments.append(segment)
-                    logger.debug(
-                        f"[{SubWriter.lrc_timestamp(segment.start)} --> "
-                        f"{SubWriter.lrc_timestamp(segment.end)}] {segment.text}"
-                    )
+            start_sample = start_frame * frame_samples
+            end_sample = len(audio) if kind == CHUNK_FINAL else min(len(audio), end_frame * frame_samples)
+            chunk = AudioChunk(
+                chunk_index, start_sample / WHISPER_SAMPLING_RATE, end_sample / WHISPER_SAMPLING_RATE, kind
+            )
+            chunk_index += 1
+            stats[kind] += 1
 
-        duration_after_vad = inner_duration_after_vad if has_inner_duration else outer_duration_after_vad
+            if not has_speech_between(split_input.vad_segments, start_sample, end_sample):
+                stats["skipped"] += 1
+                start_frame = end_frame
+                continue
+
+            chunk_segments, chunk_duration = self._transcribe_chunk(
+                model, audio, chunk, speech_probs[start_frame:end_frame], config
+            )
+            if chunk_duration is not None:
+                inner_duration_after_vad += chunk_duration
+                has_inner_duration = True
+            segments.extend(chunk_segments)
+            start_frame = end_frame
+
+        logger.info(
+            "Smart VAD split: chunks=%s pause=%s forced=%s final=%s skipped=%s",
+            chunk_index,
+            stats["pause"],
+            stats["forced"],
+            stats["final"],
+            stats["skipped"],
+        )
+        duration_after_vad = inner_duration_after_vad if has_inner_duration else split_input.duration_after_vad
         return segments, SimpleNamespace(duration=duration, duration_after_vad=duration_after_vad)
+
+    def _transcribe_standard(self, model, audio_input, transcription_config):
+        return model.transcribe(audio_input, **transcription_config)
 
     def _log_duration(self, duration: float, duration_after_vad: float) -> None:
         if duration == duration_after_vad or duration_after_vad == 0:
