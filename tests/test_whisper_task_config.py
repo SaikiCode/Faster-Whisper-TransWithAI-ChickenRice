@@ -45,9 +45,7 @@ class WhisperTaskConfigTests(unittest.TestCase):
             config_path.write_text(config_text, encoding="utf-8")
 
             inference = Inference.__new__(Inference)
-            config, _segment_merge_options, _smart_split_options = inference._load_generation_config(
-                make_args(config_path, task=task)
-            )
+            config, *_options = inference._load_generation_config(make_args(config_path, task=task))
             return config
 
     def test_uses_task_from_generation_config(self) -> None:
@@ -73,11 +71,90 @@ class WhisperTaskConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "missing.json5"
             inference = Inference.__new__(Inference)
-            config, _segment_merge_options, _smart_split_options = inference._load_generation_config(
+            config, *_options = inference._load_generation_config(make_args(config_path))
+
+        self.assertEqual(config["task"], "translate")
+
+    def test_subtitle_cleanup_options_are_read_and_not_passed_to_whisper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "generation_config.json5"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "pause_split": {"enabled": False, "min_pause_ms": 2000},
+                        "hallucination_filter": {"max_chars_per_second": 15, "blocklist": ["谢谢"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            inference = Inference.__new__(Inference)
+            config, _merge, _smart, pause_split, hallucination_filter = inference._load_generation_config(
                 make_args(config_path)
             )
 
-        self.assertEqual(config["task"], "translate")
+        self.assertNotIn("pause_split", config)
+        self.assertNotIn("hallucination_filter", config)
+        self.assertEqual(pause_split, infer_module.PauseSplitOptions(enabled=False, min_pause_ms=2000))
+        self.assertEqual(
+            hallucination_filter,
+            infer_module.HallucinationFilterOptions(max_chars_per_second=15.0, blocklist=("谢谢",)),
+        )
+
+
+class SubtitleCleanupTests(unittest.TestCase):
+    def test_segment_across_long_pauses_is_split_per_stretch_of_speech(self) -> None:
+        # Speech 169.4-174.0s, 176.2-180.8s and 184.9-187.1s, decoded as one subtitle (the 02:49 case).
+        vad_segments = [
+            {"start": int(169.4 * 16_000), "end": int(174.0 * 16_000)},
+            {"start": int(176.2 * 16_000), "end": int(180.8 * 16_000)},
+            {"start": int(184.9 * 16_000), "end": int(187.1 * 16_000)},
+        ]
+        segments = [
+            Segment(160_000, 165_000, "before"),
+            Segment(169_440, 187_120, "喂 琉璃 泰尔莉莎 要是打算就这样睡着的话 我就要亲姐姐咯 醒醒 早上好"),
+        ]
+
+        result = infer_module.split_segments_at_pauses(segments, vad_segments, infer_module.PauseSplitOptions())
+
+        self.assertEqual(
+            result,
+            [
+                Segment(160_000, 165_000, "before"),
+                Segment(169_440, 174_000, "喂 琉璃 泰尔莉莎"),
+                Segment(176_200, 180_800, "要是打算就这样睡着的话 我就要亲姐姐咯"),
+                Segment(184_900, 187_100, "醒醒 早上好"),
+            ],
+        )
+
+    def test_pause_split_can_be_disabled(self) -> None:
+        segments = [Segment(0, 10_000, "a b")]
+        vad_segments = [{"start": 0, "end": 16_000}, {"start": 128_000, "end": 160_000}]
+
+        result = infer_module.split_segments_at_pauses(
+            segments, vad_segments, infer_module.PauseSplitOptions(enabled=False)
+        )
+
+        self.assertEqual(result, segments)
+
+    def test_hallucination_filter_drops_impossible_speech_rates_and_blocklisted_text(self) -> None:
+        segments = [
+            Segment(0, 1_000, "我希望你能够在这段时间里 把你的精液尽情地射给我"),  # 22 chars in 1s
+            Segment(2_000, 3_000, "感谢您的视听。"),
+            Segment(4_000, 5_000, "完"),
+            Segment(6_000, 6_500, "嗯 好的"),  # fast but too short to judge
+            Segment(7_000, 10_000, "这样啊 那么晚上就可以大家一起亲热了呢"),
+        ]
+
+        result = infer_module.filter_hallucinations(segments, infer_module.HallucinationFilterOptions())
+
+        self.assertEqual(result, [segments[3], segments[4]])
+
+    def test_hallucination_filter_can_be_disabled(self) -> None:
+        segments = [Segment(0, 100, "感谢您的视听")]
+
+        result = infer_module.filter_hallucinations(segments, infer_module.HallucinationFilterOptions(enabled=False))
+
+        self.assertEqual(result, segments)
 
 
 class DeviceResolutionTests(unittest.TestCase):
@@ -306,6 +383,35 @@ class BatchedModeTests(unittest.TestCase):
         self.assertEqual(segments, [Segment(0, 1_000, "one"), Segment(3_000, 4_000, "two")])
         self.assertEqual(info.duration_after_vad, 2.0)
         self.assertEqual(batch_size, 4)
+
+    def test_pauses_inside_a_chunk_are_kept_short_and_mapped_back(self) -> None:
+        inference = self.make_inference()
+        default_side_effect = inference.vad_manager.get_speech_timestamps.side_effect
+
+        def get_speech_timestamps(model_id, audio, sampling_rate, speech_probs, **kwargs):
+            if len(audio) != 80_000 and speech_probs[0] > 0.5:
+                # Chunk [0, 1.6s): speech 0-0.2s, 0.9-1.0s and 1.1-1.2s (pauses of 0.7s and 0.1s).
+                return [{"start": 0, "end": 3_200}, {"start": 14_400, "end": 16_000}, {"start": 17_600, "end": 19_200}]
+            return default_side_effect(model_id, audio, sampling_rate, speech_probs, **kwargs)
+
+        inference.vad_manager.get_speech_timestamps.side_effect = get_speech_timestamps
+        batched_model = mock.Mock()
+        # In the concatenated chunk: speech 0-0.2s, kept silence 0.2-0.7s, speech 0.7-0.8s, 0.9-1.0s.
+        batched_model.transcribe.return_value = (
+            [raw_segment(0.0, 0.2, "a"), raw_segment(0.3, 1.0, "b"), raw_segment(30.0, 31.0, "two")],
+            mock.Mock(),
+        )
+
+        segments, info, _batch_size = self.run_batched(inference, batched_model)
+
+        layout = batched_model.transcribe.call_args.args[0]
+        clips = batched_model.transcribe.call_args.kwargs["clip_timestamps"]
+        self.assertEqual(clips[0], {"start": 0.0, "end": 1.0})
+        self.assertTrue(np.all(layout[3_200:11_200] == 0))
+        # "b" starts inside the kept silence, so it starts with the speech after it.
+        self.assertEqual(segments[:2], [Segment(0, 200, "a"), Segment(900, 1_200, "b")])
+        self.assertEqual(info.speech_segments, [{"start": 0, "end": 16_000}, {"start": 48_000, "end": 64_000}])
+        batched_model.transcribe.assert_called_once()  # 0.4s of speech covered: no sequential retry
 
     def test_unreliable_chunks_are_decoded_again_sequentially(self) -> None:
         batched_model = mock.Mock()

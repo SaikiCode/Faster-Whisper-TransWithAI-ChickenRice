@@ -15,6 +15,7 @@ from faster_whisper_transwithai_chickenrice.smart_split import (
     find_chunk_end,
     needs_sequential_retry,
     smooth_probs,
+    split_at_pauses,
 )
 
 # 20ms frames: 1500 frames = 30s, decision zone = last 40% = frames 900-1500 of a chunk starting at 0.
@@ -141,6 +142,66 @@ class ConcatSpeechTests(unittest.TestCase):
         speech, speech_map = concat_speech(np.zeros(100, dtype=np.float32), [], 16_000)
         self.assertEqual(len(speech), 0)
         self.assertEqual(speech_map.duration_s, 0.0)
+
+    def test_keeps_short_silence_between_pieces(self) -> None:
+        audio = np.arange(10 * 16_000, dtype=np.float32) + 1
+        # Speech 1-2s, 5-7s and 7.2-8s: pauses of 3s (0.5s kept) and 0.2s (kept whole).
+        speech, speech_map = concat_speech(
+            audio,
+            [{"start": 16_000, "end": 32_000}, {"start": 80_000, "end": 112_000}, {"start": 115_200, "end": 128_000}],
+            16_000,
+            max_gap_s=0.5,
+        )
+        self.assertEqual(len(speech), (1.0 + 0.5 + 2.0 + 0.2 + 0.8) * 16_000)
+        self.assertTrue(np.all(speech[16_000:24_000] == 0))
+        self.assertEqual(speech[24_000], 80_001)
+        self.assertAlmostEqual(speech_map.duration_s, 3.8)
+        self.assertEqual(speech_map.concat_starts, (0.0, 1.5, 3.7))
+        # A start inside kept silence belongs to the next piece, an end to the previous one.
+        self.assertEqual(speech_map.to_original(1.2), 5.0)
+        self.assertEqual(speech_map.to_original(1.2, is_end=True), 2.0)
+        self.assertEqual(speech_map.to_original(2.0), 5.5)
+        self.assertAlmostEqual(speech_map.to_original(3.9), 7.4)
+        # Speech time skips the kept silence.
+        self.assertEqual(speech_map.to_speech_time(1.2), 1.0)
+        self.assertEqual(speech_map.to_speech_time(2.0), 1.5)
+        self.assertAlmostEqual(speech_map.to_speech_time(4.5), 3.8)
+
+    def test_kept_silence_never_makes_the_result_longer_than_the_audio(self) -> None:
+        audio = np.ones(16_000, dtype=np.float32)
+        speech, _speech_map = concat_speech(
+            audio, [{"start": 0, "end": 4_000}, {"start": 4_800, "end": 16_000}], 16_000, max_gap_s=0.5
+        )
+        self.assertEqual(len(speech), 16_000)
+
+
+class SplitAtPausesTests(unittest.TestCase):
+    def split(self, start_s, end_s, text, pieces):
+        return split_at_pauses(start_s, end_s, text, pieces, min_pause_s=1.5)
+
+    def test_one_part_per_stretch_of_speech_cut_at_spaces(self) -> None:
+        self.assertEqual(
+            self.split(0.0, 13.0, "一二三 四五六 七八九", [(0.0, 3.0), (5.0, 8.0), (10.0, 13.0)]),
+            [(0.0, 3.0, "一二三"), (5.0, 8.0, "四五六"), (10.0, 13.0, "七八九")],
+        )
+
+    def test_cuts_after_clause_punctuation(self) -> None:
+        self.assertEqual(
+            self.split(0.0, 6.0, "你好？我很好", [(0.0, 2.0), (4.0, 6.0)]),
+            [(0.0, 2.0, "你好？"), (4.0, 6.0, "我很好")],
+        )
+
+    def test_short_pauses_do_not_split_but_trim_to_speech(self) -> None:
+        self.assertEqual(self.split(0.0, 7.0, "a b", [(0.5, 3.0), (3.5, 6.0)]), [(0.5, 6.0, "a b")])
+
+    def test_stretch_with_too_little_speech_is_trimmed_off(self) -> None:
+        self.assertEqual(self.split(0.0, 10.0, "a b", [(0.0, 0.2), (5.0, 9.0)]), [(5.0, 9.0, "a b")])
+
+    def test_text_without_cut_positions_is_not_split(self) -> None:
+        self.assertEqual(self.split(0.0, 6.0, "一二三四五六", [(0.0, 2.0), (4.0, 6.0)]), [(0.0, 6.0, "一二三四五六")])
+
+    def test_segment_without_speech_is_returned_as_is(self) -> None:
+        self.assertEqual(self.split(1.0, 2.0, "a b", []), [(1.0, 2.0, "a b")])
 
 
 class NeedsSequentialRetryTests(unittest.TestCase):

@@ -13,6 +13,8 @@ import platform
 import subprocess
 import sys
 import traceback
+import unicodedata
+from bisect import bisect_right
 from collections import ChainMap, Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,7 @@ from . import inject_vad, precomputed_speech_probs, uninject_vad
 from .smart_split import (
     CHUNK_FINAL,
     CHUNK_FORCED,
+    MAX_KEPT_GAP_S,
     AudioChunk,
     SpeechMap,
     choose_anchor,
@@ -56,6 +59,7 @@ from .smart_split import (
     find_chunk_end,
     needs_sequential_retry,
     smooth_probs,
+    split_at_pauses,
 )
 from .vad_manager import VadConfig, VadModelManager, resolve_neg_threshold
 
@@ -339,6 +343,23 @@ class SmartSplitOptions:
     split_window_factor: float = 0.4
 
 
+@dataclass(frozen=True)
+class PauseSplitOptions:
+    enabled: bool = True
+    min_pause_ms: int = 1_500
+
+
+DEFAULT_HALLUCINATION_BLOCKLIST = ("感谢您的视听", "感谢观看", "谢谢观看", "感谢收看", "谢谢收看", "完")
+
+
+@dataclass(frozen=True)
+class HallucinationFilterOptions:
+    enabled: bool = True
+    max_chars_per_second: float = 20.0
+    min_chars: int = 10
+    blocklist: tuple[str, ...] = DEFAULT_HALLUCINATION_BLOCKLIST
+
+
 def _normalize_merge_text(text: str) -> str:
     return " ".join(text.strip().split())
 
@@ -424,6 +445,87 @@ def merge_segments(segments: list[Segment], options: SegmentMergeOptions | None 
         merged.append(seg)
 
     return merged
+
+
+def split_segments_at_pauses(
+    segments: list[Segment],
+    vad_segments: list[dict[str, Any]],
+    options: PauseSplitOptions,
+    sampling_rate: int = WHISPER_SAMPLING_RATE,
+) -> list[Segment]:
+    """Split (or trim) segments that run across pauses of at least options.min_pause_ms in the VAD speech."""
+    if not options.enabled or not vad_segments:
+        return segments
+
+    pieces = sorted((s["start"] / sampling_rate, s["end"] / sampling_rate) for s in vad_segments)
+    piece_ends = [end for _start, end in pieces]
+    result: list[Segment] = []
+    for segment in segments:
+        start_s, end_s = segment.start / 1_000, segment.end / 1_000
+        first = bisect_right(piece_ends, start_s)
+        overlapping = []
+        for piece in pieces[first:]:
+            if piece[0] >= end_s:
+                break
+            overlapping.append(piece)
+        parts = split_at_pauses(start_s, end_s, segment.text, overlapping, min_pause_s=options.min_pause_ms / 1_000)
+        if len(parts) > 1:
+            logger.debug(
+                "Split at pauses: [%s --> %s] %s => %s",
+                SubWriter.lrc_timestamp(segment.start),
+                SubWriter.lrc_timestamp(segment.end),
+                segment.text,
+                " | ".join(text for _start, _end, text in parts),
+            )
+        for part_start, part_end, text in parts:
+            result.append(Segment(start=int(round(part_start * 1_000)), end=int(round(part_end * 1_000)), text=text))
+    return result
+
+
+def _normalize_filter_text(text: str) -> str:
+    """Text without whitespace and punctuation, for counting characters and matching the blocklist."""
+    return "".join(c for c in text if not c.isspace() and not unicodedata.category(c).startswith("P")).casefold()
+
+
+def filter_hallucinations(segments: list[Segment], options: HallucinationFilterOptions) -> list[Segment]:
+    """Drop segments that are known Whisper hallucinations or have more text than could be spoken in their time."""
+    if not options.enabled:
+        return segments
+
+    blocklist = {_normalize_filter_text(text) for text in options.blocklist}
+    kept: list[Segment] = []
+    for segment in segments:
+        normalized = _normalize_filter_text(segment.text)
+        duration_s = max(segment.end - segment.start, 1) / 1_000
+        if normalized in blocklist:
+            reason = "blocklist"
+        elif len(normalized) >= options.min_chars and len(normalized) / duration_s > options.max_chars_per_second:
+            reason = f"{len(normalized) / duration_s:.1f} chars/s"
+        else:
+            kept.append(segment)
+            continue
+        logger.info(
+            "Dropped likely hallucination (%s): [%s --> %s] %s",
+            reason,
+            SubWriter.lrc_timestamp(segment.start),
+            SubWriter.lrc_timestamp(segment.end),
+            segment.text,
+        )
+    return kept
+
+
+def _log_decoded_segment(segment: Segment, raw: Any) -> None:
+    """Debug-log a decoded segment with Whisper's confidence values, for tuning the hallucination filter."""
+    logger.debug(
+        "[%s --> %s] %s (avg_logprob=%s, no_speech_prob=%s, compression_ratio=%s, temperature=%s)",
+        SubWriter.lrc_timestamp(segment.start),
+        SubWriter.lrc_timestamp(segment.end),
+        segment.text,
+        getattr(raw, "avg_logprob", None),
+        getattr(raw, "no_speech_prob", None),
+        getattr(raw, "compression_ratio", None),
+        getattr(raw, "temperature", None),
+    )
 
 
 class SubWriter:
@@ -564,9 +666,13 @@ class Inference:
             self.sub_formats.append(k)
 
         # Load generation config
-        self.generation_config, self.segment_merge_options, self.smart_split_options = self._load_generation_config(
-            args
-        )
+        (
+            self.generation_config,
+            self.segment_merge_options,
+            self.smart_split_options,
+            self.pause_split_options,
+            self.hallucination_filter_options,
+        ) = self._load_generation_config(args)
 
         # Setup VAD injection if requested
         self._setup_vad_injection(args)
@@ -583,8 +689,22 @@ class Inference:
             self.smart_split_options.enabled,
             self.smart_split_options.target_chunk_duration_s,
         )
+        logger.info(
+            "Pause split: enabled=%s, min_pause_ms=%s",
+            self.pause_split_options.enabled,
+            self.pause_split_options.min_pause_ms,
+        )
+        logger.info(
+            "Hallucination filter: enabled=%s, max_chars_per_second=%s, min_chars=%s, blocklist=%s",
+            self.hallucination_filter_options.enabled,
+            self.hallucination_filter_options.max_chars_per_second,
+            self.hallucination_filter_options.min_chars,
+            list(self.hallucination_filter_options.blocklist),
+        )
 
-    def _load_generation_config(self, args) -> tuple[dict[str, Any], SegmentMergeOptions, SmartSplitOptions]:
+    def _load_generation_config(
+        self, args
+    ) -> tuple[dict[str, Any], SegmentMergeOptions, SmartSplitOptions, PauseSplitOptions, HallucinationFilterOptions]:
         """Load and process generation configuration"""
         # Default config
         config: dict[str, Any] = {
@@ -595,6 +715,8 @@ class Inference:
 
         segment_merge_options = SegmentMergeOptions()
         smart_split_options = SmartSplitOptions()
+        pause_split_options = PauseSplitOptions()
+        hallucination_filter_options = HallucinationFilterOptions()
 
         # Load from file if exists
         if os.path.exists(args.generation_config):
@@ -620,6 +742,25 @@ class Inference:
                     ),
                     split_window_factor=smart_split_options.split_window_factor,
                 )
+                file_pause_split = file_config.pop("pause_split", None)
+                if isinstance(file_pause_split, dict):
+                    pause_split_options = PauseSplitOptions(
+                        enabled=_coerce_bool(file_pause_split.get("enabled"), default=pause_split_options.enabled),
+                        min_pause_ms=int(file_pause_split.get("min_pause_ms", pause_split_options.min_pause_ms)),
+                    )
+                file_hallucination_filter = file_config.pop("hallucination_filter", None)
+                if isinstance(file_hallucination_filter, dict):
+                    defaults = hallucination_filter_options
+                    hallucination_filter_options = HallucinationFilterOptions(
+                        enabled=_coerce_bool(file_hallucination_filter.get("enabled"), default=defaults.enabled),
+                        max_chars_per_second=float(
+                            file_hallucination_filter.get("max_chars_per_second", defaults.max_chars_per_second)
+                        ),
+                        min_chars=int(file_hallucination_filter.get("min_chars", defaults.min_chars)),
+                        blocklist=tuple(
+                            str(text) for text in file_hallucination_filter.get("blocklist", defaults.blocklist)
+                        ),
+                    )
                 config = dict(**ChainMap(file_config, config))
 
         config["task"] = _normalize_whisper_task(args.task if args.task is not None else config.get("task"))
@@ -701,7 +842,7 @@ class Inference:
                 split_window_factor=smart_split_options.split_window_factor,
             )
 
-        return config, segment_merge_options, smart_split_options
+        return config, segment_merge_options, smart_split_options, pause_split_options, hallucination_filter_options
 
     def _vad_progress_callback(self, chunk_idx, total_chunks, device):
         """Progress callback for VAD processing."""
@@ -901,9 +1042,7 @@ class Inference:
                 continue
             segment = Segment(start=start, end=end, text=_segment.text.strip())
             segments.append(segment)
-            logger.debug(
-                f"[{SubWriter.lrc_timestamp(segment.start)} --> {SubWriter.lrc_timestamp(segment.end)}] {segment.text}"
-            )
+            _log_decoded_segment(segment, _segment)
         duration_after_vad = float(info.duration_after_vad) if hasattr(info, "duration_after_vad") else None
         return segments, duration_after_vad
 
@@ -988,7 +1127,9 @@ class Inference:
             stats["skipped"],
         )
         duration_after_vad = inner_duration_after_vad if has_inner_duration else split_input.duration_after_vad
-        return segments, SimpleNamespace(duration=duration, duration_after_vad=duration_after_vad)
+        return segments, SimpleNamespace(
+            duration=duration, duration_after_vad=duration_after_vad, speech_segments=split_input.vad_segments
+        )
 
     def _batched_config(self) -> dict[str, Any]:
         """Config for BatchedInferencePipeline.transcribe when we provide the (speech-only) clips ourselves."""
@@ -1010,7 +1151,8 @@ class Inference:
 
         Chunks are planned exactly like the sequential path (without re-anchoring, which needs the
         previous chunk's result). Each chunk's speech is concatenated with the same per-chunk VAD that
-        faster_whisper would apply, and the speech-only chunks are laid out on a 30s grid so the
+        faster_whisper would apply, keeping up to MAX_KEPT_GAP_S of each pause so Whisper still ends
+        segments there, and the speech-only chunks are laid out on a 30s grid so the
         batched pipeline decodes one chunk per window. Batched decoding has no temperature fallback
         and no seek, so chunks whose result looks unreliable are decoded again sequentially.
 
@@ -1049,7 +1191,9 @@ class Inference:
                     speech_probs=speech_probs[start_frame:end_frame],
                     **vad_parameters,
                 )
-            speech, speech_map = concat_speech(chunk_audio, inner_segments, WHISPER_SAMPLING_RATE)
+            speech, speech_map = concat_speech(
+                chunk_audio, inner_segments, WHISPER_SAMPLING_RATE, max_gap_s=MAX_KEPT_GAP_S
+            )
             if len(speech) == 0:
                 stats["skipped"] += 1
             else:
@@ -1083,7 +1227,7 @@ class Inference:
             for k, (chunk, f0, f1, _speech, speech_map) in enumerate(group):
                 spans = [(raw.start - k * window_s, raw.end - k * window_s) for raw in by_chunk[k]]
                 if needs_sequential_retry(
-                    spans,
+                    [(speech_map.to_speech_time(start), speech_map.to_speech_time(end)) for start, end in spans],
                     [raw.compression_ratio for raw in by_chunk[k]],
                     [raw.avg_logprob for raw in by_chunk[k]],
                     speech_map.duration_s,
@@ -1102,7 +1246,9 @@ class Inference:
                     end_ms = int(round((chunk.start + speech_map.to_original(local_end, is_end=True)) * 1_000))
                     end_ms = min(end_ms, int(round(chunk.end * 1_000)))
                     if end_ms > start_ms:
-                        segments.append(Segment(start=start_ms, end=end_ms, text=raw.text.strip()))
+                        segment = Segment(start=start_ms, end=end_ms, text=raw.text.strip())
+                        segments.append(segment)
+                        _log_decoded_segment(segment, raw)
             group_start += len(group)
 
         logger.info(
@@ -1115,7 +1261,10 @@ class Inference:
             stats["batched_fallback"],
         )
         duration_after_vad = sum(speech_map.duration_s for *_rest, speech_map in prepared)
-        return segments, SimpleNamespace(duration=duration, duration_after_vad=duration_after_vad), batch_size
+        info = SimpleNamespace(
+            duration=duration, duration_after_vad=duration_after_vad, speech_segments=split_input.vad_segments
+        )
+        return segments, info, batch_size
 
     def _transcribe_standard(self, model, audio_input, transcription_config):
         return model.transcribe(audio_input, **transcription_config)
@@ -1258,6 +1407,10 @@ class Inference:
 
                 self._log_duration(info.duration, duration_after_vad)
 
+                speech_segments = getattr(info, "speech_segments", None)
+                if speech_segments:
+                    segments = split_segments_at_pauses(segments, speech_segments, self.pause_split_options)
+                segments = filter_hallucinations(segments, self.hallucination_filter_options)
                 segments = enforce_segment_timeline(segments, self.segment_merge_options.max_duration_ms)
                 segments = merge_segments(segments, self.segment_merge_options)
                 segments = enforce_segment_timeline(segments, self.segment_merge_options.max_duration_ms)

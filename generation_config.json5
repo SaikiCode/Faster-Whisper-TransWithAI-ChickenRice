@@ -35,6 +35,10 @@
 
     "repetition_penalty": 1.1,
 
+    // 解码失败时的温度回退序列。高温采样是幻听（凭空编造台词）的主要来源，所以上限只到 0.4
+    // Temperature fallback when decoding fails. High-temperature sampling is the main source of hallucinations, so cap it at 0.4
+    "temperature": [0.0, 0.2, 0.4],
+
     // 智能VAD切分：先用外层VAD选择安全的连续音频块，再在每个块内启用 faster-whisper 内部VAD
     // Smart VAD split: outer VAD chooses safe contiguous chunks, then faster-whisper internal VAD runs inside each chunk
     "smart_split_with_vad": true,
@@ -57,6 +61,38 @@
         // 单条字幕合并后的最大时长（毫秒），超过则停止合并（避免出现几十秒/几分钟的超长字幕）
         // Maximum duration (ms) of a merged subtitle; stop merging when exceeded
         "max_duration_ms": 20000,
+    },
+
+    // 字幕后处理：一条字幕跨过长停顿时，在停顿处拆开（文字按空格/标点切分），避免静音期间字幕一直挂着
+    // Subtitle post-processing: split a subtitle that runs across a long pause (text is cut at spaces/punctuation)
+    "pause_split": {
+        // 是否启用
+        // Enable
+        "enabled": true,
+
+        // 停顿至少多长（毫秒）才拆分
+        // Minimum pause (ms) to split at
+        "min_pause_ms": 1500,
+    },
+
+    // 字幕后处理：丢弃明显的幻听
+    // Subtitle post-processing: drop obvious hallucinations
+    "hallucination_filter": {
+        // 是否启用
+        // Enable
+        "enabled": true,
+
+        // 每秒字数超过此值的字幕视为幻听（不计空格和标点）
+        // Subtitles with more characters per second than this are hallucinations (spaces and punctuation not counted)
+        "max_chars_per_second": 20,
+
+        // 字数少于此值的字幕不做每秒字数检查
+        // Subtitles shorter than this are not checked for characters per second
+        "min_chars": 10,
+
+        // 整条字幕（忽略空格和标点）与以下内容完全相同时丢弃
+        // Drop subtitles whose whole text (ignoring spaces and punctuation) is one of these
+        "blocklist": ["感谢您的视听", "感谢观看", "谢谢观看", "感谢收看", "谢谢收看", "完"],
     },
 
 }

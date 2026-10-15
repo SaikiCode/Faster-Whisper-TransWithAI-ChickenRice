@@ -22,6 +22,13 @@ MIN_UNCOVERED_SPEECH_S = 1.5
 MAX_UNCOVERED_SPEECH_RATIO = 0.2
 MIN_SPEECH_FOR_EMPTY_OUTPUT_S = 1.0
 
+# Silence kept between concatenated speech pieces (capped by the real pause) so Whisper still hears
+# where a sentence stops and puts a segment boundary there.
+MAX_KEPT_GAP_S = 0.5
+
+# Characters after which a subtitle's text may be cut when it is split at a pause.
+TEXT_CUT_PUNCTUATION = frozenset("，。！？、；：…,.!?;:")
+
 CHUNK_FINAL = "final"  # chunk reaches the end of the audio
 CHUNK_PAUSE = "pause"  # chunk ends inside a pause
 CHUNK_FORCED = "forced"  # no pause found; cut at the least speech-like point
@@ -149,6 +156,7 @@ class SpeechMap:
 
     @property
     def duration_s(self) -> float:
+        """Speech duration, without the silence kept between pieces."""
         return float(sum(self.durations))
 
     def to_original(self, t: float, *, is_end: bool = False) -> float:
@@ -158,16 +166,30 @@ class SpeechMap:
         if is_end and index > 0 and t <= self.concat_starts[index]:
             # An end time exactly on a join belongs to the end of the previous piece, not the next one.
             index -= 1
+        offset = t - self.concat_starts[index]
+        if not is_end and offset > self.durations[index] and index + 1 < len(self.durations):
+            # A start inside the kept silence belongs to the speech that follows it.
+            return self.orig_starts[index + 1]
+        return self.orig_starts[index] + min(max(0.0, offset), self.durations[index])
+
+    def to_speech_time(self, t: float) -> float:
+        """Map a time in the concatenated audio to the amount of speech before it (kept silence excluded)."""
+        if not self.durations:
+            return 0.0
+        index = max(0, bisect_right(self.concat_starts, t) - 1)
         offset = min(max(0.0, t - self.concat_starts[index]), self.durations[index])
-        return self.orig_starts[index] + offset
+        return float(sum(self.durations[:index])) + offset
 
 
 def concat_speech(
-    audio: np.ndarray, speech_segments: Sequence[dict[str, Any]], sampling_rate: int
+    audio: np.ndarray, speech_segments: Sequence[dict[str, Any]], sampling_rate: int, *, max_gap_s: float = 0.0
 ) -> tuple[np.ndarray, SpeechMap]:
     """
     Concatenate the speech segments (sample indices into audio) like faster_whisper's VAD filter does,
     returning the speech-only audio and the map from its timeline back to audio's timeline.
+
+    With max_gap_s > 0, up to that much silence (never more than the real pause) is kept between
+    pieces, so the result is never longer than the audio it was cut from.
     """
     pieces: list[list[int]] = []
     for segment in sorted(speech_segments, key=lambda s: s["start"]):
@@ -183,12 +205,19 @@ def concat_speech(
     if not pieces:
         return np.zeros(0, dtype=np.float32), SpeechMap((), (), ())
 
+    max_gap_samples = int(round(max_gap_s * sampling_rate))
     concat_starts: list[float] = []
+    parts: list[np.ndarray] = []
     position = 0
-    for start, end in pieces:
+    for i, (start, end) in enumerate(pieces):
+        gap = min(max_gap_samples, start - pieces[i - 1][1]) if i > 0 else 0
+        if gap > 0:
+            parts.append(np.zeros(gap, dtype=np.float32))
+            position += gap
         concat_starts.append(position / sampling_rate)
+        parts.append(audio[start:end])
         position += end - start
-    speech = np.concatenate([audio[start:end] for start, end in pieces]).astype(np.float32, copy=False)
+    speech = np.concatenate(parts).astype(np.float32, copy=False)
     speech_map = SpeechMap(
         tuple(concat_starts),
         tuple(start / sampling_rate for start, _end in pieces),
@@ -232,3 +261,66 @@ def needs_sequential_retry(
         return True
     uncovered = speech_duration_s - _covered_duration(spans, speech_duration_s)
     return uncovered > max(MIN_UNCOVERED_SPEECH_S, MAX_UNCOVERED_SPEECH_RATIO * speech_duration_s)
+
+
+def _text_cut_positions(text: str) -> list[int]:
+    """Positions where text may be cut: before whitespace or after clause punctuation."""
+    positions = set()
+    for i, char in enumerate(text):
+        if char.isspace():
+            positions.add(i)
+        elif char in TEXT_CUT_PUNCTUATION:
+            positions.add(i + 1)
+    return sorted(p for p in positions if 0 < p < len(text))
+
+
+def split_at_pauses(
+    start_s: float,
+    end_s: float,
+    text: str,
+    speech_pieces: Sequence[tuple[float, float]],
+    *,
+    min_pause_s: float,
+    min_part_speech_s: float = 0.3,
+) -> list[tuple[float, float, str]]:
+    """
+    Split a subtitle segment that runs across long pauses into one segment per stretch of speech.
+
+    speech_pieces are the sorted VAD speech pieces (seconds) overlapping the segment. Pieces closer
+    together than min_pause_s form one stretch; stretches with less than min_part_speech_s of speech
+    are dropped (the segment is trimmed instead of split). The text is cut at whitespace or clause
+    punctuation, as close as possible to each stretch's share of the speech; stretches that cannot get
+    their own text stay joined with the previous one. A segment that covers no speech is returned as is.
+    """
+    spans = [(max(s, start_s), min(e, end_s)) for s, e in speech_pieces if min(e, end_s) > max(s, start_s)]
+    if not spans:
+        return [(start_s, end_s, text)]
+
+    stretches: list[list[float]] = []  # [start, end, speech duration]
+    for s, e in spans:
+        if stretches and s - stretches[-1][1] < min_pause_s:
+            stretches[-1][1] = e
+            stretches[-1][2] += e - s
+        else:
+            stretches.append([s, e, e - s])
+    if len(stretches) > 1:
+        stretches = [st for st in stretches if st[2] >= min_part_speech_s] or [max(stretches, key=lambda st: st[2])]
+
+    total_speech = sum(st[2] for st in stretches)
+    cuts = _text_cut_positions(text)
+    parts: list[tuple[float, float, str]] = []
+    part_start = stretches[0][0]
+    prev_cut = 0
+    speech_before = 0.0
+    for k in range(len(stretches) - 1):
+        speech_before += stretches[k][2]
+        candidates = [p for p in cuts if p > prev_cut and text[prev_cut:p].strip() and text[p:].strip()]
+        if not candidates:
+            break
+        target = len(text) * speech_before / total_speech
+        cut = min(candidates, key=lambda p: (abs(p - target), p))
+        parts.append((part_start, stretches[k][1], text[prev_cut:cut].strip()))
+        prev_cut = cut
+        part_start = stretches[k + 1][0]
+    parts.append((part_start, stretches[-1][1], text[prev_cut:].strip()))
+    return parts
